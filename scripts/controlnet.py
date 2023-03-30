@@ -1,7 +1,9 @@
 import gc
 import os
 from collections import OrderedDict
-from typing import Union, Dict, Any, Optional
+from copy import copy
+from enum import Enum
+from typing import Union, Dict, Any, Optional, List
 import importlib
 
 import torch
@@ -17,9 +19,10 @@ from scripts.cldm import PlugableControlModel
 from scripts.adapter import PlugableAdapter
 from scripts.utils import load_state_dict
 from scripts.hook import ControlParams, UnetHook
-from scripts import external_code, global_state
+from scripts import external_code, global_state, hook as scripts_hook
 importlib.reload(global_state)
 importlib.reload(external_code)
+importlib.reload(scripts_hook)
 from modules.processing import StableDiffusionProcessingImg2Img
 from modules.images import save_image
 from PIL import Image
@@ -53,7 +56,13 @@ tossup_symbol = '\u2934'
 
 webcam_enabled = False
 webcam_mirrored = False
-
+global_batch_input_dir = gr.Textbox(
+    label='Controlnet input directory',
+    placeholder='Leave empty to use input directory',
+    **shared.hide_dirs,
+    elem_id='controlnet_batch_input_dir')
+img2img_batch_input_dir = None
+generate_buttons = {}
 
 class ToolButton(gr.Button, gr.components.FormComponent):
     """Small button with single emoji as text, fits inside gradio forms"""
@@ -92,8 +101,7 @@ def swap_img2img_pipeline(p: processing.StableDiffusionProcessingImg2Img):
 
 global_state.update_cn_models()
 
-def image_dict_from_unit(unit) -> Optional[Dict[str, np.ndarray]]:
-    image = unit.image
+def image_dict_from_any(image) -> Optional[Dict[str, np.ndarray]]:
     if image is None:
         return None
 
@@ -114,6 +122,24 @@ def image_dict_from_unit(unit) -> Optional[Dict[str, np.ndarray]]:
     return dict(image)
 
 
+class InputMode(Enum):
+    SIMPLE = "simple"
+    BATCH = "batch"
+
+
+class UiControlNetUnit(external_code.ControlNetUnit):
+    def __init__(
+        self,
+        input_mode: InputMode=InputMode.SIMPLE,
+        batch_images: Optional[Union[str, List[external_code.InputImage]]]=None,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.is_ui = True
+        self.input_mode = input_mode
+        self.batch_images = batch_images
+
+
 class Script(scripts.Script):
     model_cache = OrderedDict()
 
@@ -128,6 +154,11 @@ class Script(scripts.Script):
         self.txt2img_h_slider = gr.Slider()
         self.img2img_w_slider = gr.Slider()
         self.img2img_h_slider = gr.Slider()
+        self.current_batch_index = 0
+
+        def submit_callback(_id):
+            self.current_batch_index = 0
+        img2img_tab_tracker.submit_callbacks.append(submit_callback)
 
     def title(self):
         return "ControlNet"
@@ -154,8 +185,9 @@ class Script(scripts.Script):
     def get_threshold_block(self, proc):
         pass
 
-    def get_default_ui_unit(self):
-        return external_code.ControlNetUnit(
+    def get_default_ui_unit(self, is_ui=True):
+        cls = UiControlNetUnit if is_ui else external_code.ControlNetUnit
+        return cls(
             enabled=False,
             module="none",
             model="None",
@@ -163,12 +195,18 @@ class Script(scripts.Script):
         )
 
     def uigroup(self, tabname, is_img2img):
-        ctrls = ()
         infotext_fields = []
         default_unit = self.get_default_ui_unit()
+        setattr(default_unit, 'is_ui', True)
+
         with gr.Row():
-            input_image = gr.Image(source='upload', mirror_webcam=False, type='numpy', tool='sketch')
-            generated_image = gr.Image(label="Annotator result", visible=False)
+            with gr.Tabs():
+                with gr.Tab(label='Upload') as upload_tab:
+                    upload_image = gr.Image(source='upload', mirror_webcam=False, type='numpy', tool='sketch')
+                    generated_image = gr.Image(label="Annotator result", visible=False)
+
+                with gr.Tab(label='Batch') as batch_tab:
+                    batch_image_dir = gr.Textbox(label='Input directory', placeholder='Leave empty to use img2img batch controlnet input directory')
 
         with gr.Row():
             gr.HTML(value='<p>Invert colors if your image has white background.<br >Change your brush width to make it thinner if you want to draw something.<br ></p>')
@@ -183,7 +221,6 @@ class Script(scripts.Script):
             lowvram = gr.Checkbox(label='Low VRAM', value=default_unit.low_vram)
             guess_mode = gr.Checkbox(label='Guess Mode', value=default_unit.guess_mode)
 
-        ctrls += (enabled,)
         # infotext_fields.append((enabled, "ControlNet Enabled"))
         
         def send_dimensions(image):
@@ -209,8 +246,8 @@ class Script(scripts.Script):
             webcam_mirrored = not webcam_mirrored
             return {"mirror_webcam": webcam_mirrored, "__type__": "update"}
             
-        webcam_enable.click(fn=webcam_toggle, inputs=None, outputs=input_image)
-        webcam_mirror.click(fn=webcam_mirror_toggle, inputs=None, outputs=input_image)
+        webcam_enable.click(fn=webcam_toggle, inputs=None, outputs=upload_image)
+        webcam_mirror.click(fn=webcam_mirror_toggle, inputs=None, outputs=upload_image)
 
         def refresh_all_models(*inputs):
             global_state.update_cn_models()
@@ -230,7 +267,6 @@ class Script(scripts.Script):
             guidance_start = gr.Slider(label="Guidance Start (T)", value=default_unit.guidance_start, minimum=0.0, maximum=1.0, interactive=True)
             guidance_end = gr.Slider(label="Guidance End (T)", value=default_unit.guidance_end, minimum=0.0, maximum=1.0, interactive=True)
 
-            ctrls += (module, model, weight,)
                 # model_dropdowns.append(model)
         def build_sliders(module):
             if module == "canny":
@@ -336,7 +372,7 @@ class Script(scripts.Script):
                     base64_str = str(encoded_string, "utf-8")
                     base64_str = "data:image/png;base64,"+ base64_str
                     inputs['image'] = base64_str
-                return input_image.orgpreprocess(inputs)
+                return upload_image.orgpreprocess(inputs)
             return None
 
         resize_mode = gr.Radio(choices=[e.value for e in external_code.ResizeMode], value=default_unit.resize_mode.value, label="Resize Mode")
@@ -350,7 +386,7 @@ class Script(scripts.Script):
                 canvas_swap_res.click(lambda w, h: (h, w), inputs=[canvas_width, canvas_height], outputs=[canvas_width, canvas_height])
                     
         create_button = gr.Button(value="Create blank canvas")
-        create_button.click(fn=create_canvas, inputs=[canvas_height, canvas_width], outputs=[input_image])
+        create_button.click(fn=create_canvas, inputs=[canvas_height, canvas_width], outputs=[upload_image])
         
         def run_annotator(image, module, pres, pthr_a, pthr_b):
             img = HWC3(image['image'])
@@ -370,45 +406,76 @@ class Script(scripts.Script):
             annotator_button = gr.Button(value="Preview annotator result")
             annotator_button_hide = gr.Button(value="Hide annotator result")
         
-        annotator_button.click(fn=run_annotator, inputs=[input_image, module, processor_res, threshold_a, threshold_b], outputs=[generated_image])
+        annotator_button.click(fn=run_annotator, inputs=[upload_image, module, processor_res, threshold_a, threshold_b], outputs=[generated_image])
         annotator_button_hide.click(fn=lambda: gr.update(visible=False), inputs=None, outputs=[generated_image])
 
         if is_img2img:
-            send_dimen_button.click(fn=send_dimensions, inputs=[input_image], outputs=[self.img2img_w_slider, self.img2img_h_slider])
+            send_dimen_button.click(fn=send_dimensions, inputs=[upload_image], outputs=[self.img2img_w_slider, self.img2img_h_slider])
         else:
-            send_dimen_button.click(fn=send_dimensions, inputs=[input_image], outputs=[self.txt2img_w_slider, self.txt2img_h_slider])                                        
-        
-        ctrls += (input_image, scribble_mode, resize_mode, rgbbgr_mode)
-        ctrls += (lowvram,)
-        ctrls += (processor_res, threshold_a, threshold_b, guidance_start, guidance_end, guess_mode)
-        self.register_modules(tabname, ctrls)
+            send_dimen_button.click(fn=send_dimensions, inputs=[upload_image], outputs=[self.txt2img_w_slider, self.txt2img_h_slider])
 
-        input_image.orgpreprocess=input_image.preprocess
-        input_image.preprocess=svgPreprocess
+        input_mode = gr.State(InputMode.SIMPLE)
+        input_image = gr.State()
+        batch_image_dir_state = gr.State('')
+        unit_args = (input_mode, batch_image_dir_state, enabled, module, model, weight, input_image, scribble_mode, resize_mode, rgbbgr_mode, lowvram, processor_res, threshold_a, threshold_b, guidance_start, guidance_end, guess_mode)
+        self.register_modules(tabname, unit_args)
 
-        def controlnet_unit_from_args(*args):
-            unit = external_code.ControlNetUnit(*args)
-            setattr(unit, 'is_ui', True)
-            return unit
+        upload_image.orgpreprocess=upload_image.preprocess
+        upload_image.preprocess=svgPreprocess
 
         unit = gr.State(default_unit)
-        for comp in ctrls:
-            event_subscribers = []
-            if hasattr(comp, 'edit'):
-                event_subscribers.append(comp.edit)
-            elif hasattr(comp, 'click'):
-                event_subscribers.append(comp.click)
+        for comp in unit_args:
+            for events in (
+                ('edit', 'clear'),
+                ('click',),
+                ('change',),
+            ):
+                if not all(hasattr(comp, event) for event in events): continue
+                for event in events:
+                    getattr(comp, event)(fn=UiControlNetUnit, inputs=list(unit_args), outputs=unit)
+
+                break
+
+        components = list(unit_args)
+        components[6] = upload_image
+        for event in 'edit', 'clear':
+            getattr(upload_image, event)(fn=lambda *args: (args[6], UiControlNetUnit(*args)), inputs=components, outputs=[input_image, unit])
+
+        components = list(unit_args)
+        for input_tab in (
+            (upload_tab, InputMode.SIMPLE),
+            (batch_tab, InputMode.BATCH)
+        ):
+            components[0] = gr.State(input_tab[1])
+            input_tab[0].select(fn=lambda *args: (args[0], UiControlNetUnit(*args)), inputs=components, outputs=[input_mode, unit])
+
+        def determine_batch_dir(batch_dir, fallback_dir, fallback_fallback_dir, *args):
+            args = list(args)
+            if batch_dir:
+                args[1] = batch_dir
+            elif fallback_dir:
+                args[1] = fallback_dir
+            elif fallback_fallback_dir:
+                args[1] = fallback_fallback_dir
             else:
-                event_subscribers.append(comp.change)
+                args[1] = fallback_dir
 
-            if hasattr(comp, 'clear'):
-                event_subscribers.append(comp.clear)
+            return args[1], UiControlNetUnit(*args)
 
-            for event_subscriber in event_subscribers:
-                event_subscriber(fn=controlnet_unit_from_args, inputs=list(ctrls), outputs=unit)
+        global global_batch_input_dir, img2img_batch_input_dir
+        batch_dirs = [
+            batch_image_dir,
+            global_batch_input_dir,
+            img2img_batch_input_dir if img2img_batch_input_dir is not None else gr.State(None)
+        ]
+        for batch_dir_comp in batch_dirs:
+            if not hasattr(batch_dir_comp, 'change'): continue
+            batch_dir_comp.change(
+                fn=determine_batch_dir,
+                inputs=batch_dirs + list(unit_args),
+                outputs=[batch_image_dir_state, unit])
 
         return unit
-
 
     def ui(self, is_img2img):
         """this function should create gradio UI elements. See https://gradio.app/docs/#components
@@ -429,7 +496,7 @@ class Script(scripts.Script):
                 else:
                     with gr.Column():
                         controls += (self.uigroup(f"ControlNet", is_img2img),)
-                        
+
         if shared.opts.data.get("control_net_sync_field_args", False):
             for _, field_name in self.infotext_fields:
                 self.paste_field_names.append(field_name)
@@ -603,7 +670,98 @@ class Script(scripts.Script):
         return control, detected_map
 
     def is_ui(self, args):
-        return args and isinstance(args[0], external_code.ControlNetUnit) and getattr(args[0], 'is_ui', False)
+        return args and all(isinstance(arg, UiControlNetUnit) for arg in args)
+
+    def normalize_to_batch_mode(self, units):
+        if not units:
+            return units, 1
+
+        units = [copy(unit) for unit in units]
+        for unit in units:
+            if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.BATCH:
+                if isinstance(unit.batch_images, str):
+                    unit.batch_images = [np.array(Image.open(os.path.join(unit.batch_images, image_path))).astype('uint8')
+                                         for image_path in os.listdir(unit.batch_images)
+                                         if os.path.isfile(os.path.join(unit.batch_images, image_path))]
+
+        batch_size = min(len(unit.batch_images) if getattr(unit, 'batch_images', []) else 1 for unit in units)
+        for unit in units:
+            if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.SIMPLE:
+                unit.batch_images = [unit.image] * batch_size
+                unit.input_mode = InputMode.BATCH
+
+            unit.batch_images = unit.batch_images[:batch_size]
+
+        return units, batch_size
+
+    def compute_control_maps(self, p, unit, preprocessor, batch_image, detected_maps, idx):
+        p_input_image = self.get_remote_call(p, "control_net_input_image", None, idx)
+        resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
+        invert_image = unit.invert_image
+        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
+        is_img2img_batch_tab = is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
+
+        batch_image = image_dict_from_any(batch_image)
+
+        if batch_image is not None:
+            while len(batch_image['mask'].shape) < 3:
+                batch_image['mask'] = batch_image['mask'][..., np.newaxis]
+
+        if is_img2img_batch_tab and getattr(p, "image_control", None) is not None:
+            input_image = HWC3(np.asarray(p.image_control))
+        elif p_input_image is not None:
+            input_image = HWC3(np.asarray(p_input_image))
+        elif batch_image is not None:
+            # Need to check the image for API compatibility
+            if isinstance(batch_image['image'], str):
+                from modules.api.api import decode_base64_to_image
+                input_image = HWC3(np.asarray(decode_base64_to_image(batch_image['image'])))
+            else:
+                input_image = HWC3(batch_image['image'])
+
+            # Adding 'mask' check for API compatibility
+            if 'mask' in batch_image and not (
+                    (batch_image['mask'][:, :, 0] == 0).all() or (batch_image['mask'][:, :, 0] == 255).all()):
+                print("using mask as input")
+                input_image = HWC3(batch_image['mask'][:, :, 0])
+                invert_image = True
+        else:
+            # use img2img init_image as default
+            input_image = getattr(p, "init_images", [None])[0]
+            if input_image is None:
+                raise ValueError('controlnet is enabled but no input image is given')
+            input_image = HWC3(np.asarray(input_image))
+
+        if issubclass(type(p),
+                      StableDiffusionProcessingImg2Img) and p.inpaint_full_res == True and p.image_mask is not None:
+            input_image = Image.fromarray(input_image)
+            mask = p.image_mask.convert('L')
+            crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
+            crop_region = masking.expand_crop_region(crop_region, p.width, p.height, mask.width, mask.height)
+
+            input_image = input_image.crop(crop_region)
+            input_image = images.resize_image(2, input_image, p.width, p.height)
+            input_image = HWC3(np.asarray(input_image))
+
+        if invert_image:
+            detected_map = np.zeros_like(input_image, dtype=np.uint8)
+            detected_map[np.min(input_image, axis=2) < 127] = 255
+            input_image = detected_map
+
+        if unit.processor_res > 64:
+            detected_map, is_image = preprocessor(input_image, res=unit.processor_res, thr_a=unit.threshold_a,
+                                                  thr_b=unit.threshold_b)
+        else:
+            detected_map, is_image = preprocessor(input_image)
+
+        if is_image:
+            control, detected_map = self.detectmap_proc(detected_map, unit.module, unit.rgbbgr_mode, resize_mode,
+                                                        p.height, p.width)
+            detected_maps.append((detected_map, unit.module))
+        else:
+            control = detected_map
+
+        return control
 
     def process(self, p, *args):
         """
@@ -620,7 +778,7 @@ class Script(scripts.Script):
         enabled_units = []
         if len(params_group) == 0:
             # fill a null group
-            remote_unit = self.parse_remote_call(p, self.get_default_ui_unit(), 0)
+            remote_unit = self.parse_remote_call(p, self.get_default_ui_unit(is_ui=False), 0)
             if remote_unit.enabled:
                 params_group.append(remote_unit)
 
@@ -644,6 +802,16 @@ class Script(scripts.Script):
                 f"{prefix} Guidance End": unit.guidance_end,
             })
 
+        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
+        enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
+        if self.current_batch_index == 0:
+            if img2img_tab_tracker.submit_img2img_tab != 'img2img_batch_tab' or not is_img2img:
+                p.n_iter *= cn_batch_size
+                p.all_prompts *= cn_batch_size
+                p.all_negative_prompts *= cn_batch_size
+                p.all_seeds *= cn_batch_size
+                p.all_subseeds *= cn_batch_size
+
         if len(params_group) == 0 or len(enabled_units) == 0:
            self.latest_network = None
            return 
@@ -664,79 +832,27 @@ class Script(scripts.Script):
 
         self.latest_model_hash = p.sd_model.sd_model_hash
         for idx, unit in enumerate(enabled_units):
-            p_input_image = self.get_remote_call(p, "control_net_input_image", None, idx)
-            image = image_dict_from_unit(unit)
-            if image is not None:
-                while len(image['mask'].shape) < 3:
-                    image['mask'] = image['mask'][..., np.newaxis]
-
-            resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
-            invert_image = unit.invert_image
-
             if unit.low_vram:
                 hook_lowvram = True
-                
+
             model_net = self.load_control_model(p, unet, unit.model, unit.low_vram)
             model_net.reset()
 
-            is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
-            is_img2img_batch_tab = is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
-            if is_img2img_batch_tab and getattr(p, "image_control", None) is not None:
-                input_image = HWC3(np.asarray(p.image_control))
-            elif p_input_image is not None:
-                input_image = HWC3(np.asarray(p_input_image))
-            elif image is not None:
-                # Need to check the image for API compatibility
-                if isinstance(image['image'], str):
-                    from modules.api.api import decode_base64_to_image
-                    input_image = HWC3(np.asarray(decode_base64_to_image(image['image'])))
-                else:
-                    input_image = HWC3(image['image'])
-
-                # Adding 'mask' check for API compatibility
-                if 'mask' in image and not ((image['mask'][:, :, 0]==0).all() or (image['mask'][:, :, 0]==255).all()):
-                    print("using mask as input")
-                    input_image = HWC3(image['mask'][:, :, 0])
-                    invert_image = True
-            else:
-                # use img2img init_image as default
-                input_image = getattr(p, "init_images", [None])[0] 
-                if input_image is None:
-                    raise ValueError('controlnet is enabled but no input image is given')
-                input_image = HWC3(np.asarray(input_image))
-
-            if issubclass(type(p), StableDiffusionProcessingImg2Img) and p.inpaint_full_res == True and p.image_mask is not None:
-                input_image = Image.fromarray(input_image)
-                mask = p.image_mask.convert('L')
-                crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
-                crop_region = masking.expand_crop_region(crop_region, p.width, p.height, mask.width, mask.height)
-
-                input_image = input_image.crop(crop_region)
-                input_image = images.resize_image(2, input_image, p.width, p.height)
-                input_image = HWC3(np.asarray(input_image))
-
-            if invert_image:
-                detected_map = np.zeros_like(input_image, dtype=np.uint8)
-                detected_map[np.min(input_image, axis=2) < 127] = 255
-                input_image = detected_map
-
             print(f"Loading preprocessor: {unit.module}")
             preprocessor = self.preprocessor[unit.module]
-            h, w, bsz = p.height, p.width, p.batch_size
-            if unit.processor_res > 64:
-                detected_map, is_image = preprocessor(input_image, res=unit.processor_res, thr_a=unit.threshold_a, thr_b=unit.threshold_b)
+
+            control_maps = []
+            if is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab':
+                control_map = self.compute_control_maps(p, unit, preprocessor, unit.batch_images[self.current_batch_index], detected_maps, idx)
+                control_maps.append(control_map)
             else:
-                detected_map, is_image = preprocessor(input_image)
-            
-            if is_image:
-                control, detected_map = self.detectmap_proc(detected_map, unit.module, unit.rgbbgr_mode, resize_mode, h, w)
-                detected_maps.append((detected_map, unit.module))
-            else:
-                control = detected_map  
+                for batch_image in unit.batch_images:
+                    control_map = self.compute_control_maps(p, unit, preprocessor, batch_image, detected_maps, idx)
+                    control_maps.append(control_map)
 
             forward_param = ControlParams(
                 control_model=model_net,
-                hint_cond=control,
+                hint_cond=control_maps[0],
                 guess_mode=unit.guess_mode,
                 weight=unit.weight,
                 guidance_stopped=False,
@@ -744,7 +860,11 @@ class Script(scripts.Script):
                 stop_guidance_percent=unit.guidance_end,
                 advanced_weighting=None,
                 is_adapter=isinstance(model_net, PlugableAdapter),
-                is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter"
+                is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter",
+                all_hint_conds=control_maps,
+                enable_hr=getattr(p, 'enable_hr', False) and getattr(p, 'hr_scale', 1) != 1, #no hires pass when == 1
+                total_steps=p.steps,
+                hr_second_pass_steps=getattr(p, 'hr_second_pass_steps', p.steps)
             )
             forward_params.append(forward_param)
 
@@ -770,6 +890,9 @@ class Script(scripts.Script):
                     save_image(img, detectmap_dir, module)
 
         is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
+        if is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab':
+            self.current_batch_index += 1
+
         is_img2img_batch_tab = self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
         if self.latest_network is None or is_img2img_batch_tab:
             return
@@ -789,6 +912,7 @@ class Script(scripts.Script):
 
         gc.collect()
         devices.torch_gc()
+
 
 def update_script_args(p, value, arg_idx):
     for s in scripts.scripts_txt2img.alwayson_scripts:
@@ -844,10 +968,13 @@ class Img2ImgTabTracker:
         self.active_img2img_tab = 'img2img_img2img_tab'
         self.submit_img2img_tab = None
         self.submit_button = None
+        self.submit_callbacks = []
 
     def save_submit_img2img_tab(self, button_elem_id):
         self.submit_img2img_tab = self.active_img2img_tab
         self.submit_button = button_elem_id
+        for submit_callback in self.submit_callbacks:
+            submit_callback(button_elem_id)
 
     def set_active_img2img_tab(self, tab_elem_id):
         self.active_img2img_tab = tab_elem_id
@@ -869,6 +996,15 @@ class Img2ImgTabTracker:
             return
 
 
+def on_after_component(component, **_kwargs):
+    global img2img_batch_input_dir
+    if type(component) is gr.Textbox and getattr(component, 'elem_id', None) == 'img2img_batch_input_dir':
+        img2img_batch_input_dir = component
+        global_batch_input_dir.render()
+        return
+
+
 img2img_tab_tracker = Img2ImgTabTracker()
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(img2img_tab_tracker.on_after_component_callback)
+script_callbacks.on_after_component(on_after_component)

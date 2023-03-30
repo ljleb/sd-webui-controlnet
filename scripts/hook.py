@@ -50,7 +50,11 @@ class ControlParams:
         stop_guidance_percent, 
         advanced_weighting, 
         is_adapter,
-        is_extra_cond
+        is_extra_cond,
+        all_hint_conds=None,
+        enable_hr=False,
+        total_steps=0,
+        hr_second_pass_steps=0
     ):
         self.control_model = control_model
         self.hint_cond = hint_cond
@@ -62,6 +66,12 @@ class ControlParams:
         self.advanced_weighting = advanced_weighting
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
+        self.all_hint_conds = all_hint_conds if all_hint_conds is not None else []
+        self.enable_hr = enable_hr
+        self.is_hires = False
+        self.total_steps = total_steps
+        self.hr_second_pass_steps = hr_second_pass_steps
+        self.current_steps = 0
 
 
 class UnetHook(nn.Module):
@@ -120,7 +130,7 @@ class UnetHook(nn.Module):
             total_extra_cond = torch.zeros([0, context.shape[-1]]).to(devices.get_device_for("controlnet"))
             only_mid_control = outer.only_mid_control
             require_inpaint_hijack = False
-            
+
             # handle external cond first
             for param in outer.control_params:
                 if param.guidance_stopped or not param.is_extra_cond:
@@ -152,14 +162,34 @@ class UnetHook(nn.Module):
                 
             # handle unet injection stuff
             for param in outer.control_params:
+                do_next_hint_cond = False
+                if param.is_hires and param.current_steps >= param.hr_second_pass_steps:
+                    param.current_steps = 0
+                    param.is_hires = False
+                    do_next_hint_cond = bool(param.all_hint_conds)
+                elif not param.is_hires and param.current_steps >= param.total_steps:
+                    param.current_steps = 0
+                    param.is_hires = param.enable_hr
+                    do_next_hint_cond = param.all_hint_conds and not param.is_hires
+
+                param.current_steps += 1
+
+                hint_cond = param.hint_cond
+                if do_next_hint_cond:
+                    current_hint_cond_index = 0
+                    for current_hint_cond_index, _hint_cond in enumerate(param.all_hint_conds):
+                        if hint_cond is _hint_cond: break
+                    del _hint_cond
+                    next_hint_cond_index = (current_hint_cond_index + 1) % len(param.all_hint_conds)
+                    param.hint_cond = param.all_hint_conds[next_hint_cond_index]
+
                 if param.guidance_stopped or param.is_extra_cond:
                     continue
                 if outer.lowvram:
                     param.control_model.to(devices.get_device_for("controlnet"))
-                    
+
                 # hires stuffs
-                # note that this method may not works if hr_scale < 1.1
-                if abs(x.shape[-1] - param.hint_cond.shape[-1] // 8) > 8:
+                if param.is_hires:
                     only_mid_control = shared.opts.data.get("control_net_only_midctrl_hires", True)
                     # If you want to completely disable control net, uncomment this.
                     # return self._original_forward(x, timesteps=timesteps, context=context, **kwargs)
@@ -172,8 +202,8 @@ class UnetHook(nn.Module):
                     x_in = x[:, :4, ...]
                     require_inpaint_hijack = True
                     
-                assert param.hint_cond is not None, f"Controlnet is enabled but no input image is given"  
-                control = param.control_model(x=x_in, hint=param.hint_cond, timesteps=timesteps, context=context)
+                assert hint_cond is not None, f"Controlnet is enabled but no input image is given"
+                control = param.control_model(x=x_in, hint=hint_cond, timesteps=timesteps, context=context)
                 control_scales = ([param.weight] * 13)
                 
                 if outer.lowvram:
