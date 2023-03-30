@@ -52,9 +52,6 @@ class ControlParams:
         is_adapter,
         is_extra_cond,
         all_hint_conds=None,
-        enable_hr=False,
-        total_steps=0,
-        hr_second_pass_steps=0
     ):
         self.control_model = control_model
         self.hint_cond = hint_cond
@@ -67,11 +64,6 @@ class ControlParams:
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
         self.all_hint_conds = all_hint_conds if all_hint_conds is not None else []
-        self.enable_hr = enable_hr
-        self.is_hires = False
-        self.total_steps = total_steps
-        self.hr_second_pass_steps = hr_second_pass_steps
-        self.current_steps = 0
 
 
 class UnetHook(nn.Module):
@@ -131,6 +123,19 @@ class UnetHook(nn.Module):
             only_mid_control = outer.only_mid_control
             require_inpaint_hijack = False
 
+            next_hint_cond = False
+            if outer.is_hires and outer.current_steps >= outer.hr_total_steps:
+                outer.current_steps = 0
+                outer.is_hires = False
+                next_hint_cond = True
+            elif not outer.is_hires and outer.current_steps >= outer.total_steps:
+                outer.current_steps = 0
+                outer.is_hires = outer.enable_hr
+                next_hint_cond = not outer.is_hires
+
+            current_steps = outer.current_steps
+            outer.current_steps += 1
+
             # handle external cond first
             for param in outer.control_params:
                 if param.guidance_stopped or not param.is_extra_cond:
@@ -159,23 +164,13 @@ class UnetHook(nn.Module):
                     cond = torch.cat([cond, total_extra_cond], dim=1)
                     uncond = torch.cat([uncond, uncond[:, -total_extra_cond.shape[1]:, :]], dim=1)
                     context = torch.cat([cond, uncond], dim=0)
-                
+
             # handle unet injection stuff
             for param in outer.control_params:
-                do_next_hint_cond = False
-                if param.is_hires and param.current_steps >= param.hr_second_pass_steps:
-                    param.current_steps = 0
-                    param.is_hires = False
-                    do_next_hint_cond = bool(param.all_hint_conds)
-                elif not param.is_hires and param.current_steps >= param.total_steps:
-                    param.current_steps = 0
-                    param.is_hires = param.enable_hr
-                    do_next_hint_cond = param.all_hint_conds and not param.is_hires
-
-                param.current_steps += 1
-
                 hint_cond = param.hint_cond
-                if do_next_hint_cond:
+
+                # batch stuff
+                if next_hint_cond and param.all_hint_conds:
                     current_hint_cond_index = 0
                     for current_hint_cond_index, _hint_cond in enumerate(param.all_hint_conds):
                         if hint_cond is _hint_cond: break
@@ -269,10 +264,15 @@ class UnetHook(nn.Module):
         model.forward = forward2.__get__(model, UNetModel)
         scripts.script_callbacks.on_cfg_denoiser(guidance_schedule_handler)
     
-    def notify(self, params, is_vanilla_samplers): # lint: list[ControlParams]
+    def notify(self, params, is_vanilla_samplers, enable_hr, total_steps, hr_total_steps): # lint: list[ControlParams]
         self.is_vanilla_samplers = is_vanilla_samplers
         self.control_params = params
         self.guess_mode = any([param.guess_mode for param in params])
+        self.enable_hr = enable_hr
+        self.is_hires = False
+        self.total_steps = total_steps
+        self.hr_total_steps = hr_total_steps
+        self.current_steps = 0
 
     def restore(self, model):
         scripts.script_callbacks.remove_current_script_callbacks()

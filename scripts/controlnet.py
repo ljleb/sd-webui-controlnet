@@ -14,8 +14,8 @@ import gradio as gr
 import numpy as np
 
 from einops import rearrange
-from scripts.processor import *
 from scripts.cldm import PlugableControlModel
+from scripts.processor import *
 from scripts.adapter import PlugableAdapter
 from scripts.utils import load_state_dict
 from scripts.hook import ControlParams, UnetHook
@@ -197,8 +197,6 @@ class Script(scripts.Script):
     def uigroup(self, tabname, is_img2img):
         infotext_fields = []
         default_unit = self.get_default_ui_unit()
-        setattr(default_unit, 'is_ui', True)
-
         with gr.Row():
             with gr.Tabs():
                 with gr.Tab(label='Upload') as upload_tab:
@@ -694,7 +692,7 @@ class Script(scripts.Script):
 
         return units, batch_size
 
-    def compute_control_maps(self, p, unit, preprocessor, batch_image, detected_maps, idx):
+    def compute_control_map(self, p, unit, preprocessor, batch_image, detected_maps, idx):
         p_input_image = self.get_remote_call(p, "control_net_input_image", None, idx)
         resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
         invert_image = unit.invert_image
@@ -843,11 +841,11 @@ class Script(scripts.Script):
 
             control_maps = []
             if is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab':
-                control_map = self.compute_control_maps(p, unit, preprocessor, unit.batch_images[self.current_batch_index], detected_maps, idx)
+                control_map = self.compute_control_map(p, unit, preprocessor, unit.batch_images[self.current_batch_index], detected_maps, idx)
                 control_maps.append(control_map)
             else:
                 for batch_image in unit.batch_images:
-                    control_map = self.compute_control_maps(p, unit, preprocessor, batch_image, detected_maps, idx)
+                    control_map = self.compute_control_map(p, unit, preprocessor, batch_image, detected_maps, idx)
                     control_maps.append(control_map)
 
             forward_param = ControlParams(
@@ -862,9 +860,6 @@ class Script(scripts.Script):
                 is_adapter=isinstance(model_net, PlugableAdapter),
                 is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter",
                 all_hint_conds=control_maps,
-                enable_hr=getattr(p, 'enable_hr', False) and getattr(p, 'hr_scale', 1) != 1, #no hires pass when == 1
-                total_steps=p.steps,
-                hr_second_pass_steps=getattr(p, 'hr_second_pass_steps', p.steps)
             )
             forward_params.append(forward_param)
 
@@ -872,7 +867,13 @@ class Script(scripts.Script):
 
         self.latest_network = UnetHook(lowvram=hook_lowvram)    
         self.latest_network.hook(unet)
-        self.latest_network.notify(forward_params, p.sampler_name in ["DDIM", "PLMS", "UniPC"])
+        self.latest_network.notify(
+            forward_params,
+            p.sampler_name in ["DDIM", "PLMS", "UniPC"],
+            enable_hr=getattr(p, 'enable_hr', False) and getattr(p, 'hr_scale', 1) != 1, # no hires pass when == 1
+            total_steps=p.steps,
+            hr_second_pass_steps=getattr(p, 'hr_second_pass_steps', p.steps),
+        )
         self.detected_map = detected_maps
 
         if len(enabled_units) > 0 and shared.opts.data.get("control_net_skip_img2img_processing") and hasattr(p, "init_images"):
