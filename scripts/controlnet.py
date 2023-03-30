@@ -62,6 +62,7 @@ global_batch_input_dir = gr.Textbox(
     **shared.hide_dirs,
     elem_id='controlnet_batch_input_dir')
 img2img_batch_input_dir = None
+img2img_batch_input_dir_subscribers = []
 generate_buttons = {}
 
 class ToolButton(gr.Button, gr.components.FormComponent):
@@ -421,6 +422,7 @@ class Script(scripts.Script):
         upload_image.orgpreprocess=upload_image.preprocess
         upload_image.preprocess=svgPreprocess
 
+        # update unit when any of its properties changes
         unit = gr.State(default_unit)
         for comp in unit_args:
             for events in (
@@ -434,11 +436,13 @@ class Script(scripts.Script):
 
                 break
 
+        # keep upload_image in sync with input_image
         components = list(unit_args)
         components[6] = upload_image
         for event in 'edit', 'clear':
             getattr(upload_image, event)(fn=lambda *args: (args[6], UiControlNetUnit(*args)), inputs=components, outputs=[input_image, unit])
 
+        # keep input_mode in sync
         components = list(unit_args)
         for input_tab in (
             (upload_tab, InputMode.SIMPLE),
@@ -447,33 +451,37 @@ class Script(scripts.Script):
             components[0] = gr.State(input_tab[1])
             input_tab[0].select(fn=lambda *args: (args[0], UiControlNetUnit(*args)), inputs=components, outputs=[input_mode, unit])
 
+        # keep batch_dir in sync with global batch input text boxes
+        global img2img_batch_input_dir, img2img_batch_input_dir_subscribers
+        subscribe_for_batch_dir = lambda: self.subscribe_for_batch_dir(batch_image_dir, unit_args, batch_image_dir_state, unit)
+        if img2img_batch_input_dir is None:
+            # we are too soon, subscribe later when available
+            img2img_batch_input_dir_subscribers.append(subscribe_for_batch_dir)
+        else:
+            subscribe_for_batch_dir()
+
+        return unit
+
+    def subscribe_for_batch_dir(self, batch_image_dir, unit_args, batch_image_dir_state, unit):
         def determine_batch_dir(batch_dir, fallback_dir, fallback_fallback_dir, *args):
             args = list(args)
             if batch_dir:
                 args[1] = batch_dir
             elif fallback_dir:
                 args[1] = fallback_dir
-            elif fallback_fallback_dir:
-                args[1] = fallback_fallback_dir
             else:
-                args[1] = fallback_dir
+                args[1] = fallback_fallback_dir
 
             return args[1], UiControlNetUnit(*args)
 
         global global_batch_input_dir, img2img_batch_input_dir
-        batch_dirs = [
-            batch_image_dir,
-            global_batch_input_dir,
-            img2img_batch_input_dir if img2img_batch_input_dir is not None else gr.State(None)
-        ]
+        batch_dirs = [batch_image_dir, global_batch_input_dir, img2img_batch_input_dir]
         for batch_dir_comp in batch_dirs:
             if not hasattr(batch_dir_comp, 'change'): continue
             batch_dir_comp.change(
                 fn=determine_batch_dir,
                 inputs=batch_dirs + list(unit_args),
                 outputs=[batch_image_dir_state, unit])
-
-        return unit
 
     def ui(self, is_img2img):
         """this function should create gradio UI elements. See https://gradio.app/docs/#components
@@ -1003,6 +1011,8 @@ def on_after_component(component, **_kwargs):
     global img2img_batch_input_dir
     if getattr(component, 'elem_id', None) == 'img2img_batch_input_dir':
         img2img_batch_input_dir = component
+        for subscriber in img2img_batch_input_dir_subscribers:
+            subscriber()
         return
 
     if getattr(component, 'elem_id', None) == 'img2img_batch_inpaint_mask_dir':
