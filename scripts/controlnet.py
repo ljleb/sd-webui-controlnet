@@ -19,10 +19,10 @@ from scripts.processor import *
 from scripts.adapter import PlugableAdapter
 from scripts.utils import load_state_dict
 from scripts.hook import ControlParams, UnetHook
-from scripts import external_code, global_state, hook as scripts_hook
+from scripts import external_code, global_state, hook
 importlib.reload(global_state)
 importlib.reload(external_code)
-importlib.reload(scripts_hook)
+importlib.reload(hook)
 from modules.processing import StableDiffusionProcessingImg2Img
 from modules.images import save_image
 from PIL import Image
@@ -167,7 +167,7 @@ class Script(scripts.Script):
         # if is_img2img:
             # return False
         return scripts.AlwaysVisible
-    
+
     def after_component(self, component, **kwargs):
         if component.elem_id == "txt2img_width":
             self.txt2img_w_slider = component
@@ -767,6 +767,9 @@ class Script(scripts.Script):
         You can modify the processing object (p) here, inject hooks, etc.
         args contains all values returned by components from ui()
         """
+        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
+        is_img2img_batch_tab = self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
+
         unet = p.sd_model.model.diffusion_model
         if self.latest_network is not None:
             # always restore (~0.05s)
@@ -800,10 +803,9 @@ class Script(scripts.Script):
                 f"{prefix} Guidance End": unit.guidance_end,
             })
 
-        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
         enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
         if self.current_batch_index == 0:
-            if img2img_tab_tracker.submit_img2img_tab != 'img2img_batch_tab' or not is_img2img:
+            if not is_img2img_batch_tab:
                 p.n_iter *= cn_batch_size
                 p.all_prompts *= cn_batch_size
                 p.all_negative_prompts *= cn_batch_size
@@ -840,7 +842,7 @@ class Script(scripts.Script):
             preprocessor = self.preprocessor[unit.module]
 
             control_maps = []
-            if is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab':
+            if is_img2img_batch_tab:
                 control_map = self.compute_control_map(p, unit, preprocessor, unit.batch_images[self.current_batch_index], detected_maps, idx)
                 control_maps.append(control_map)
             else:
@@ -872,7 +874,7 @@ class Script(scripts.Script):
             p.sampler_name in ["DDIM", "PLMS", "UniPC"],
             enable_hr=getattr(p, 'enable_hr', False) and getattr(p, 'hr_scale', 1) != 1, # no hires pass when == 1
             total_steps=p.steps,
-            hr_second_pass_steps=getattr(p, 'hr_second_pass_steps', p.steps),
+            hr_total_steps=getattr(p, 'hr_second_pass_steps', p.steps),
         )
         self.detected_map = detected_maps
 
@@ -999,8 +1001,11 @@ class Img2ImgTabTracker:
 
 def on_after_component(component, **_kwargs):
     global img2img_batch_input_dir
-    if type(component) is gr.Textbox and getattr(component, 'elem_id', None) == 'img2img_batch_input_dir':
+    if getattr(component, 'elem_id', None) == 'img2img_batch_input_dir':
         img2img_batch_input_dir = component
+        return
+
+    if getattr(component, 'elem_id', None) == 'img2img_batch_inpaint_mask_dir':
         global_batch_input_dir.render()
         return
 

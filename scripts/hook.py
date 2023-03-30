@@ -184,7 +184,7 @@ class UnetHook(nn.Module):
                     param.control_model.to(devices.get_device_for("controlnet"))
 
                 # hires stuffs
-                if param.is_hires:
+                if outer.is_hires:
                     only_mid_control = shared.opts.data.get("control_net_only_midctrl_hires", True)
                     # If you want to completely disable control net, uncomment this.
                     # return self._original_forward(x, timesteps=timesteps, context=context, **kwargs)
