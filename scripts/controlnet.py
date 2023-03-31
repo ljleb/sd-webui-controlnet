@@ -156,6 +156,7 @@ class Script(scripts.Script):
         self.img2img_w_slider = gr.Slider()
         self.img2img_h_slider = gr.Slider()
         self.current_batch_index = 0
+        self.cn_batch_size = 1
 
         def submit_callback(_id):
             self.current_batch_index = 0
@@ -810,14 +811,14 @@ class Script(scripts.Script):
                 f"{prefix} Guidance End": unit.guidance_end,
             })
 
-        enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
+        enabled_units, self.cn_batch_size = self.normalize_to_batch_mode(enabled_units)
         if self.current_batch_index == 0:
             if not is_img2img_batch_tab:
-                p.n_iter *= cn_batch_size
-                p.all_prompts *= cn_batch_size
-                p.all_negative_prompts *= cn_batch_size
-                p.all_seeds *= cn_batch_size
-                p.all_subseeds *= cn_batch_size
+                p.n_iter *= self.cn_batch_size
+                p.all_prompts *= self.cn_batch_size
+                p.all_negative_prompts *= self.cn_batch_size
+                p.all_seeds *= self.cn_batch_size
+                p.all_subseeds *= self.cn_batch_size
 
         if len(params_group) == 0 or len(enabled_units) == 0:
            self.latest_network = None
@@ -882,10 +883,10 @@ class Script(scripts.Script):
         if len(enabled_units) > 0 and shared.opts.data.get("control_net_skip_img2img_processing") and hasattr(p, "init_images"):
             swap_img2img_pipeline(p)
 
-    def process_batch(self, p, *args, **kwargs):
-        if kwargs['batch_number'] <= 0: return
+    def before_process_batch(self, p, *args, **kwargs):
+        batch_i = kwargs['batch_number']
         for param in self.forward_params:
-            param.hint_cond = param.all_hint_conds[kwargs['batch_number']]
+            param.hint_cond = param.all_hint_conds[batch_i % self.cn_batch_size]
 
     def postprocess(self, p, processed, *args):
         del self.forward_params
