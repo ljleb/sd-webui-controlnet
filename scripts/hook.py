@@ -63,7 +63,7 @@ class ControlParams:
         self.advanced_weighting = advanced_weighting
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
-        self.all_hint_conds = all_hint_conds if all_hint_conds is not None else []
+        self.all_hint_conds = all_hint_conds if all_hint_conds is not None else [hint_cond]
 
 
 class UnetHook(nn.Module):

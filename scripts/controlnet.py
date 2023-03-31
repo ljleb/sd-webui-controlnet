@@ -439,23 +439,20 @@ class Script(scripts.Script):
 
                 break
 
-        def index_of_parameter(parameter, cls=UiControlNetUnit):
-            index = inspect.getfullargspec(cls.__init__)[0].index(parameter)
-            index -= 1  # remove self
-            if cls is external_code.ControlNetUnit:
-                index += len(inspect.getfullargspec(UiControlNetUnit.__init__)[0])
-                index -= 1 # remove self
+        def index_of_init_parameter(parameter):
+            parameters = inspect.getfullargspec(UiControlNetUnit.__init__)[0][1:] + inspect.getfullargspec(external_code.ControlNetUnit.__init__)[0][1:]
+            index = parameters.index(parameter)
             return index
 
         # keep upload_image in sync with input_image
-        upload_image_index = index_of_parameter('image', cls=external_code.ControlNetUnit)
+        upload_image_index = index_of_init_parameter('image')
         components = list(unit_args)
         components[upload_image_index] = upload_image
         for event in 'edit', 'clear':
             getattr(upload_image, event)(fn=lambda *args: (args[upload_image_index], UiControlNetUnit(*args)), inputs=components, outputs=[input_image, unit])
 
         # keep input_mode in sync
-        input_mode_index = index_of_parameter('input_mode')
+        input_mode_index = index_of_init_parameter('input_mode')
         components = list(unit_args)
         for input_tab in (
             (upload_tab, InputMode.SIMPLE),
@@ -464,7 +461,7 @@ class Script(scripts.Script):
             components[input_mode_index] = gr.State(input_tab[1])
             input_tab[0].select(fn=lambda *args: (args[input_mode_index], UiControlNetUnit(*args)), inputs=components, outputs=[input_mode, unit])
 
-        batch_dir_index = index_of_parameter('batch_images')
+        batch_dir_index = index_of_init_parameter('batch_images')
         def determine_batch_dir(batch_dir, fallback_dir, fallback_fallback_dir, *args):
             args = list(args)
             if batch_dir:
