@@ -52,7 +52,6 @@ class ControlParams:
         is_adapter,
         is_extra_cond,
         all_hint_conds=None,
-        hint_cond_index=0,
     ):
         self.control_model = control_model
         self.hint_cond = hint_cond
@@ -65,7 +64,6 @@ class ControlParams:
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
         self.all_hint_conds = all_hint_conds if all_hint_conds is not None else []
-        self.hint_cond_index = hint_cond_index
 
 
 class UnetHook(nn.Module):
