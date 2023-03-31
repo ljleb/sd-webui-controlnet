@@ -4,7 +4,7 @@ import os
 from collections import OrderedDict
 from copy import copy
 from enum import Enum
-from typing import Union, Dict, Any, Optional, List
+from typing import Union, Dict, Any, Optional, List, Tuple
 import importlib
 
 import torch
@@ -688,22 +688,30 @@ class Script(scripts.Script):
     def is_ui(self, args):
         return args and all(isinstance(arg, UiControlNetUnit) for arg in args)
 
-    def normalize_to_batch_mode(self, units):
+    def normalize_to_batch_mode(self, units: List[external_code.ControlNetUnit]) -> Tuple[List[external_code.ControlNetUnit], int]:
         if not units:
             return units, 1
 
         units = [copy(unit) for unit in units]
+        any_unit_is_batch = False
         for unit in units:
             if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.BATCH:
+                any_unit_is_batch = True
                 if isinstance(unit.batch_images, str):
                     unit.batch_images = [np.array(Image.open(os.path.join(unit.batch_images, image_path))).astype('uint8')
                                          for image_path in os.listdir(unit.batch_images)
                                          if os.path.isfile(os.path.join(unit.batch_images, image_path))]
 
-        batch_size = min(len(unit.batch_images) if getattr(unit, 'batch_images', []) else 1 for unit in units)
+        if any_unit_is_batch:
+            batch_size = min(len(getattr(unit, 'batch_images', []))
+                             for unit in units
+                             if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.BATCH)
+        else:
+            batch_size = 1
+
         for unit in units:
             if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.SIMPLE:
-                unit.batch_images = [unit.image] * batch_size
+                unit.batch_images = [unit.image]
                 unit.input_mode = InputMode.BATCH
 
             unit.batch_images = unit.batch_images[:batch_size]
