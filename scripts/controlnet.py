@@ -19,10 +19,11 @@ from scripts.processor import *
 from scripts.adapter import PlugableAdapter
 from scripts.utils import load_state_dict
 from scripts.hook import ControlParams, UnetHook
-from scripts import external_code, global_state, hook
+from scripts import global_state, hook, external_code, xyz_grid_support
 importlib.reload(global_state)
-importlib.reload(external_code)
 importlib.reload(hook)
+importlib.reload(external_code)
+importlib.reload(xyz_grid_support)
 from modules.processing import StableDiffusionProcessingImg2Img
 from modules.images import save_image
 from PIL import Image
@@ -156,7 +157,7 @@ class Script(scripts.Script):
         self.img2img_w_slider = gr.Slider()
         self.img2img_h_slider = gr.Slider()
         self.current_batch_index = 0
-        self.cn_batch_size = 1
+        self.forward_params = []
 
         def submit_callback(_id):
             self.current_batch_index = 0
@@ -811,21 +812,21 @@ class Script(scripts.Script):
                 f"{prefix} Guidance End": unit.guidance_end,
             })
 
-        enabled_units, self.cn_batch_size = self.normalize_to_batch_mode(enabled_units)
+        enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
         if self.current_batch_index == 0:
             if not is_img2img_batch_tab:
-                p.n_iter *= self.cn_batch_size
-                p.all_prompts *= self.cn_batch_size
-                p.all_negative_prompts *= self.cn_batch_size
-                p.all_seeds *= self.cn_batch_size
-                p.all_subseeds *= self.cn_batch_size
+                p.n_iter *= cn_batch_size
+                p.all_prompts *= cn_batch_size
+                p.all_negative_prompts *= cn_batch_size
+                p.all_seeds *= cn_batch_size
+                p.all_subseeds *= cn_batch_size
 
         if len(params_group) == 0 or len(enabled_units) == 0:
            self.latest_network = None
            return 
 
         detected_maps = []
-        self.forward_params = []
+        self.forward_params.clear()
         hook_lowvram = False
         
         # cache stuff
@@ -886,10 +887,10 @@ class Script(scripts.Script):
     def before_process_batch(self, p, *args, **kwargs):
         batch_i = kwargs['batch_number']
         for param in self.forward_params:
-            param.hint_cond = param.all_hint_conds[batch_i % self.cn_batch_size]
+            param.hint_cond = param.all_hint_conds[batch_i % len(param.all_hint_conds)]
 
     def postprocess(self, p, processed, *args):
-        del self.forward_params
+        self.forward_params.clear()
         if shared.opts.data.get("control_net_detectmap_autosaving", False) and self.latest_network is not None:
             for detect_map, module in self.detected_map:
                 detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir", False), module)
