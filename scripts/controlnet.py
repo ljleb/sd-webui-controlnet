@@ -451,18 +451,6 @@ class Script(scripts.Script):
             components[0] = gr.State(input_tab[1])
             input_tab[0].select(fn=lambda *args: (args[0], UiControlNetUnit(*args)), inputs=components, outputs=[input_mode, unit])
 
-        # keep batch_dir in sync with global batch input text boxes
-        global img2img_batch_input_dir, img2img_batch_input_dir_subscribers
-        subscribe_for_batch_dir = lambda: self.subscribe_for_batch_dir(batch_image_dir, unit_args, batch_image_dir_state, unit)
-        if img2img_batch_input_dir is None:
-            # we are too soon, subscribe later when available
-            img2img_batch_input_dir_subscribers.append(subscribe_for_batch_dir)
-        else:
-            subscribe_for_batch_dir()
-
-        return unit
-
-    def subscribe_for_batch_dir(self, batch_image_dir, unit_args, batch_image_dir_state, unit):
         def determine_batch_dir(batch_dir, fallback_dir, fallback_fallback_dir, *args):
             args = list(args)
             if batch_dir:
@@ -474,14 +462,25 @@ class Script(scripts.Script):
 
             return args[1], UiControlNetUnit(*args)
 
-        global global_batch_input_dir, img2img_batch_input_dir
-        batch_dirs = [batch_image_dir, global_batch_input_dir, img2img_batch_input_dir]
-        for batch_dir_comp in batch_dirs:
-            if not hasattr(batch_dir_comp, 'change'): continue
-            batch_dir_comp.change(
-                fn=determine_batch_dir,
-                inputs=batch_dirs + list(unit_args),
-                outputs=[batch_image_dir_state, unit])
+        # keep batch_dir in sync with global batch input text boxes
+        global img2img_batch_input_dir, img2img_batch_input_dir_subscribers
+        def subscribe_for_batch_dir():
+            global global_batch_input_dir, img2img_batch_input_dir
+            batch_dirs = [batch_image_dir, global_batch_input_dir, img2img_batch_input_dir]
+            for batch_dir_comp in batch_dirs:
+                if not hasattr(batch_dir_comp, 'change'): continue
+                batch_dir_comp.change(
+                    fn=determine_batch_dir,
+                    inputs=batch_dirs + list(unit_args),
+                    outputs=[batch_image_dir_state, unit])
+
+        if img2img_batch_input_dir is None:
+            # we are too soon, subscribe later when available
+            img2img_batch_input_dir_subscribers.append(subscribe_for_batch_dir)
+        else:
+            subscribe_for_batch_dir()
+
+        return unit
 
     def ui(self, is_img2img):
         """this function should create gradio UI elements. See https://gradio.app/docs/#components
@@ -825,7 +824,7 @@ class Script(scripts.Script):
            return 
 
         detected_maps = []
-        forward_params = []
+        self.forward_params = []
         hook_lowvram = False
         
         # cache stuff
@@ -871,25 +870,25 @@ class Script(scripts.Script):
                 is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter",
                 all_hint_conds=control_maps,
             )
-            forward_params.append(forward_param)
+            self.forward_params.append(forward_param)
 
             del model_net
 
         self.latest_network = UnetHook(lowvram=hook_lowvram)    
         self.latest_network.hook(unet)
-        self.latest_network.notify(
-            forward_params,
-            p.sampler_name in ["DDIM", "PLMS", "UniPC"],
-            enable_hr=getattr(p, 'enable_hr', False) and getattr(p, 'hr_scale', 1) != 1, # no hires pass when == 1
-            total_steps=p.steps,
-            hr_total_steps=getattr(p, 'hr_second_pass_steps', p.steps),
-        )
+        self.latest_network.notify(self.forward_params, p.sampler_name in ["DDIM", "PLMS", "UniPC"])
         self.detected_map = detected_maps
 
         if len(enabled_units) > 0 and shared.opts.data.get("control_net_skip_img2img_processing") and hasattr(p, "init_images"):
             swap_img2img_pipeline(p)
 
+    def process_batch(self, p, *args, **kwargs):
+        if kwargs['batch_number'] <= 0: return
+        for param in self.forward_params:
+            param.hint_cond = param.all_hint_conds[kwargs['batch_number']]
+
     def postprocess(self, p, processed, *args):
+        del self.forward_params
         if shared.opts.data.get("control_net_detectmap_autosaving", False) and self.latest_network is not None:
             for detect_map, module in self.detected_map:
                 detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir", False), module)

@@ -52,6 +52,7 @@ class ControlParams:
         is_adapter,
         is_extra_cond,
         all_hint_conds=None,
+        hint_cond_index=0,
     ):
         self.control_model = control_model
         self.hint_cond = hint_cond
@@ -64,6 +65,7 @@ class ControlParams:
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
         self.all_hint_conds = all_hint_conds if all_hint_conds is not None else []
+        self.hint_cond_index = hint_cond_index
 
 
 class UnetHook(nn.Module):
@@ -89,7 +91,7 @@ class UnetHook(nn.Module):
                 zeros = torch.zeros_like(base)
                 zeros[:, :x.shape[1], ...] = x
                 x = zeros
-                
+
             # assume the input format is [cond, uncond] and they have same shape
             # see https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/0cc0ee1bcb4c24a8c9715f66cede06601bfc00c8/modules/sd_samplers_kdiffusion.py#L114
             if base.shape[0] % 2 == 0 and (self.guess_mode or shared.opts.data.get("control_net_cfg_based_guidance", False)):
@@ -123,19 +125,6 @@ class UnetHook(nn.Module):
             only_mid_control = outer.only_mid_control
             require_inpaint_hijack = False
 
-            next_hint_cond = False
-            if outer.is_hires and outer.current_steps >= outer.hr_total_steps:
-                outer.current_steps = 0
-                outer.is_hires = False
-                next_hint_cond = True
-            elif not outer.is_hires and outer.current_steps >= outer.total_steps:
-                outer.current_steps = 0
-                outer.is_hires = outer.enable_hr
-                next_hint_cond = not outer.is_hires
-
-            current_steps = outer.current_steps
-            outer.current_steps += 1
-
             # handle external cond first
             for param in outer.control_params:
                 if param.guidance_stopped or not param.is_extra_cond:
@@ -167,24 +156,14 @@ class UnetHook(nn.Module):
 
             # handle unet injection stuff
             for param in outer.control_params:
-                hint_cond = param.hint_cond
-
-                # batch stuff
-                if next_hint_cond and param.all_hint_conds:
-                    current_hint_cond_index = 0
-                    for current_hint_cond_index, _hint_cond in enumerate(param.all_hint_conds):
-                        if hint_cond is _hint_cond: break
-                    del _hint_cond
-                    next_hint_cond_index = (current_hint_cond_index + 1) % len(param.all_hint_conds)
-                    param.hint_cond = param.all_hint_conds[next_hint_cond_index]
-
                 if param.guidance_stopped or param.is_extra_cond:
                     continue
                 if outer.lowvram:
                     param.control_model.to(devices.get_device_for("controlnet"))
 
                 # hires stuffs
-                if outer.is_hires:
+                # note that this method may not works if hr_scale < 1.1
+                if abs(x.shape[-1] - param.hint_cond.shape[-1] // 8) > 8:
                     only_mid_control = shared.opts.data.get("control_net_only_midctrl_hires", True)
                     # If you want to completely disable control net, uncomment this.
                     # return self._original_forward(x, timesteps=timesteps, context=context, **kwargs)
@@ -197,8 +176,8 @@ class UnetHook(nn.Module):
                     x_in = x[:, :4, ...]
                     require_inpaint_hijack = True
                     
-                assert hint_cond is not None, f"Controlnet is enabled but no input image is given"
-                control = param.control_model(x=x_in, hint=hint_cond, timesteps=timesteps, context=context)
+                assert param.hint_cond is not None, f"Controlnet is enabled but no input image is given"
+                control = param.control_model(x=x_in, hint=param.hint_cond, timesteps=timesteps, context=context)
                 control_scales = ([param.weight] * 13)
                 
                 if outer.lowvram:
@@ -264,15 +243,10 @@ class UnetHook(nn.Module):
         model.forward = forward2.__get__(model, UNetModel)
         scripts.script_callbacks.on_cfg_denoiser(guidance_schedule_handler)
     
-    def notify(self, params, is_vanilla_samplers, enable_hr, total_steps, hr_total_steps): # lint: list[ControlParams]
+    def notify(self, params, is_vanilla_samplers): # lint: list[ControlParams]
         self.is_vanilla_samplers = is_vanilla_samplers
         self.control_params = params
         self.guess_mode = any([param.guess_mode for param in params])
-        self.enable_hr = enable_hr
-        self.is_hires = False
-        self.total_steps = total_steps
-        self.hr_total_steps = hr_total_steps
-        self.current_steps = 0
 
     def restore(self, model):
         scripts.script_callbacks.remove_current_script_callbacks()
