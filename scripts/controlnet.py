@@ -125,15 +125,36 @@ def image_dict_from_any(image) -> Optional[Dict[str, np.ndarray]]:
     return dict(image)
 
 
-def process_batch_hijack(*args, **kwargs):
+def img2img_process_batch_tab():
     global img2img_batch_index, is_img2img_batch
     img2img_batch_index = 0
     is_img2img_batch = True
 
+
+def img2img_postprocess_batch_tab_each():
+    global img2img_batch_index
+    img2img_batch_index += 1
+
+
+def img2img_postprocess_batch_tab():
+    global img2img_batch_index, is_img2img_batch
+    is_img2img_batch = False
+    cn_scripts = (external_code.find_cn_script(script_runner) for script_runner in (scripts.scripts_img2img, scripts.scripts_txt2img))
+    cn_scripts = [cn_script for cn_script in cn_scripts if cn_script is not None]
+    for cn_script in cn_scripts:
+        cn_script.input_image = None
+        if cn_script.latest_network is not None:
+            cn_script.latest_network.restore(shared.sd_model.model.diffusion_model)
+            cn_script.latest_network = None
+
+
+def img2img_process_batch_hijack(*args, **kwargs):
+    img2img_process_batch_tab()
+
     def img2img_scripts_run_hijack(*args, **kwargs):
         global img2img_batch_index
         res = original_img2img_scripts_run(*args, **kwargs)
-        img2img_batch_index += 1
+        img2img_postprocess_batch_tab_each()
         return res
 
     original_img2img_scripts_run = scripts.scripts_img2img.run
@@ -143,21 +164,17 @@ def process_batch_hijack(*args, **kwargs):
         return getattr(img2img, '__controlnet_original_process_batch')(*args, **kwargs)
     finally:
         scripts.scripts_img2img.run = original_img2img_scripts_run
-        is_img2img_batch = False
-        cn_scripts = (external_code.find_cn_script(script_runner) for script_runner in (scripts.scripts_img2img, scripts.scripts_txt2img))
-        cn_scripts = [cn_script for cn_script in cn_scripts if cn_script is not None]
-        for cn_script in cn_scripts:
-            cn_script.input_image = None
-            if cn_script.latest_network is not None:
-                cn_script.latest_network.restore(shared.sd_model.model.diffusion_model)
-                cn_script.latest_network = None
+        img2img_postprocess_batch_tab()
 
 
 img2img_batch_index = 0
 is_img2img_batch = False
-if not hasattr(img2img, '__controlnet_original_process_batch'):
-    setattr(img2img, '__controlnet_original_process_batch', img2img.process_batch)
-    img2img.process_batch = process_batch_hijack
+if hasattr(img2img, '__controlnet_original_process_batch'):
+    # reset in case extension was updated
+    img2img.process_batch = getattr(img2img, '__controlnet_original_process_batch')
+
+setattr(img2img, '__controlnet_original_process_batch', img2img.process_batch)
+img2img.process_batch = img2img_process_batch_hijack
 
 
 class InputMode(Enum):
