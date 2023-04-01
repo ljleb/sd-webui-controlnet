@@ -10,7 +10,7 @@ import importlib
 import torch
 
 import modules.scripts as scripts
-from modules import shared, devices, script_callbacks, processing, masking, images
+from modules import shared, devices, script_callbacks, processing, masking, images, img2img
 import gradio as gr
 import numpy as np
 
@@ -125,6 +125,23 @@ def image_dict_from_any(image) -> Optional[Dict[str, np.ndarray]]:
     return dict(image)
 
 
+def process_batch_hijack(*args, **kwargs):
+    global img2img_batch_index, is_img2img_batch
+    img2img_batch_index = 0
+    is_img2img_batch = True
+    try:
+        return getattr(img2img, '__controlnet_original_process_batch')(*args, **kwargs)
+    finally:
+        is_img2img_batch = False
+
+
+img2img_batch_index = 0
+is_img2img_batch = False
+if not hasattr(img2img, '__controlnet_original_process_batch'):
+    setattr(img2img, '__controlnet_original_process_batch', img2img.process_batch)
+    img2img.process_batch = process_batch_hijack
+
+
 class InputMode(Enum):
     SIMPLE = "simple"
     BATCH = "batch"
@@ -159,13 +176,8 @@ class Script(scripts.Script):
         self.txt2img_h_slider = gr.Slider()
         self.img2img_w_slider = gr.Slider()
         self.img2img_h_slider = gr.Slider()
-        self.current_batch_index = 0
         self.forward_params = []
         self.detected_map = []
-
-        def submit_callback(_id):
-            self.current_batch_index = 0
-        img2img_tab_tracker.submit_callbacks.append(submit_callback)
 
     def title(self):
         return "ControlNet"
@@ -212,7 +224,6 @@ class Script(scripts.Script):
 
                 with gr.Tab(label='Batch') as batch_tab:
                     batch_image_dir = gr.Textbox(label='Input directory', placeholder='Leave empty to use img2img batch controlnet input directory')
-                    feed_last_image = gr.Checkbox(label='Feed last generated image back into this unit')
 
         with gr.Row():
             gr.HTML(value='<p>Invert colors if your image has white background.<br >Change your brush width to make it thinner if you want to draw something.<br ></p>')
@@ -226,6 +237,7 @@ class Script(scripts.Script):
             rgbbgr_mode = gr.Checkbox(label='RGB to BGR', value=default_unit.rgbbgr_mode)
             lowvram = gr.Checkbox(label='Low VRAM', value=default_unit.low_vram)
             guess_mode = gr.Checkbox(label='Guess Mode', value=default_unit.guess_mode)
+            feed_last_image = gr.Checkbox(label='Feed last generated image back into this unit')
 
         # infotext_fields.append((enabled, "ControlNet Enabled"))
         
@@ -692,10 +704,6 @@ class Script(scripts.Script):
     def is_ui(self, args):
         return args and all(isinstance(arg, UiControlNetUnit) for arg in args)
 
-    def is_img2img_batch_tab(self, args):
-        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
-        return self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
-
     def normalize_to_batch_mode(self, units: List[external_code.ControlNetUnit]) -> Tuple[List[external_code.ControlNetUnit], int]:
         if not units:
             return units, 1
@@ -707,8 +715,7 @@ class Script(scripts.Script):
                 any_unit_is_batch = True
                 if isinstance(unit.batch_images, str):
                     unit.batch_images = [np.array(Image.open(os.path.join(unit.batch_images, image_path))).astype('uint8')
-                                         for image_path in os.listdir(unit.batch_images)
-                                         if os.path.isfile(os.path.join(unit.batch_images, image_path))]
+                                         for image_path in shared.listfiles(unit.batch_images)]
 
         if any_unit_is_batch:
             batch_size = min(len(getattr(unit, 'batch_images', []))
@@ -737,7 +744,7 @@ class Script(scripts.Script):
             while len(batch_image['mask'].shape) < 3:
                 batch_image['mask'] = batch_image['mask'][..., np.newaxis]
 
-        if self.is_img2img_batch_tab(args) and getattr(p, "image_control", None) is not None:
+        if is_img2img_batch and getattr(p, "image_control", None) is not None:
             input_image = HWC3(np.asarray(p.image_control))
         elif p_input_image is not None:
             input_image = HWC3(np.asarray(p_input_image))
@@ -830,13 +837,12 @@ class Script(scripts.Script):
             })
 
         enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
-        if self.current_batch_index == 0:
-            if not self.is_img2img_batch_tab(args):
-                p.n_iter *= cn_batch_size
-                p.all_prompts *= cn_batch_size
-                p.all_negative_prompts *= cn_batch_size
-                p.all_seeds *= cn_batch_size
-                p.all_subseeds *= cn_batch_size
+        if not is_img2img_batch:
+            p.n_iter *= cn_batch_size
+            p.all_prompts *= cn_batch_size
+            p.all_negative_prompts *= cn_batch_size
+            p.all_seeds *= cn_batch_size
+            p.all_subseeds *= cn_batch_size
 
         if len(params_group) == 0 or len(enabled_units) == 0:
            self.latest_network = None
@@ -855,7 +861,7 @@ class Script(scripts.Script):
                 self.unloadable.get(key, lambda:None)()
 
         self.latest_model_hash = p.sd_model.sd_model_hash
-        if self.current_batch_index == 0:
+        if not is_img2img_batch or img2img_batch_index == 0:
             self.detected_map.clear()
             self.forward_params.clear()
             for idx, unit in enumerate(enabled_units):
@@ -894,7 +900,7 @@ class Script(scripts.Script):
         enabled_units = [unit for unit in units if unit.enabled]
         enabled_units, cn_unit_batch_size = self.normalize_to_batch_mode(enabled_units)
 
-        batch_image_i = (self.current_batch_index % cn_unit_batch_size) if self.is_img2img_batch_tab(args) else batch_i
+        batch_image_i = (img2img_batch_index % cn_unit_batch_size) if is_img2img_batch else batch_i
         for i, unit in enumerate(enabled_units):
             if getattr(unit, 'feed_last_image', False) and batch_image_i > 0:
                 continue
@@ -920,6 +926,10 @@ class Script(scripts.Script):
             param.hint_cond = control_map
 
     def postprocess(self, p, processed, *args):
+        units = external_code.get_all_units_from(args)
+        enabled_units = [unit for unit in units if unit.enabled]
+        enabled_units, cn_unit_batch_size = self.normalize_to_batch_mode(enabled_units)
+
         if shared.opts.data.get("control_net_detectmap_autosaving", False) and self.latest_network is not None:
             for detect_map, module in self.detected_map:
                 detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir"), module)
@@ -930,11 +940,15 @@ class Script(scripts.Script):
                     img = Image.fromarray(detect_map)
                     save_image(img, detectmap_dir, module)
 
-        if self.is_img2img_batch_tab(args):
+        global img2img_batch_index
+        if is_img2img_batch:
             self.detected_map.clear()
-            self.current_batch_index += 1
+            img2img_batch_index += 1
+            if img2img_batch_index >= cn_unit_batch_size:
+                self.forward_params.clear()
             return
 
+        self.forward_params.clear()
         if self.latest_network is None:
             return
 
@@ -951,7 +965,6 @@ class Script(scripts.Script):
         self.latest_network.restore(p.sd_model.model.diffusion_model)
         self.latest_network = None
         self.detected_map.clear()
-        self.forward_params.clear()
 
         gc.collect()
         devices.torch_gc()
@@ -1003,40 +1016,6 @@ def on_ui_settings():
         False, "Passing ControlNet parameters with \"Send to img2img\"", gr.Checkbox, {"interactive": True}, section=section))
     # shared.opts.add_option("control_net_advanced_weighting", shared.OptionInfo(
     #     False, "Enable advanced weight tuning", gr.Checkbox, {"interactive": False}, section=section))
-    
-    
-class Img2ImgTabTracker:
-    def __init__(self):
-        self.img2img_tabs = set()
-        self.active_img2img_tab = 'img2img_img2img_tab'
-        self.submit_img2img_tab = None
-        self.submit_button = None
-        self.submit_callbacks = []
-
-    def save_submit_img2img_tab(self, button_elem_id):
-        self.submit_img2img_tab = self.active_img2img_tab
-        self.submit_button = button_elem_id
-        for submit_callback in self.submit_callbacks:
-            submit_callback(button_elem_id)
-
-    def set_active_img2img_tab(self, tab_elem_id):
-        self.active_img2img_tab = tab_elem_id
-
-    def on_after_component_callback(self, component, **_kwargs):
-        if type(component) is gr.State:
-            return
-
-        if type(component) is gr.Button and component.elem_id in ('img2img_generate', 'txt2img_generate'):
-            component.click(fn=self.save_submit_img2img_tab, inputs=gr.State(component.elem_id), outputs=[])
-            return
-
-        tab = getattr(component, 'parent', None)
-        is_tab = type(tab) is gr.Tab and getattr(tab, 'elem_id', None) is not None
-        is_img2img_tab = is_tab and getattr(tab, 'parent', None) is not None and getattr(tab.parent, 'elem_id', None) == 'mode_img2img'
-        if is_img2img_tab and tab.elem_id not in self.img2img_tabs:
-            tab.select(fn=self.set_active_img2img_tab, inputs=gr.State(tab.elem_id), outputs=[])
-            self.img2img_tabs.add(tab.elem_id)
-            return
 
 
 def on_after_component(component, **_kwargs):
@@ -1052,7 +1031,5 @@ def on_after_component(component, **_kwargs):
         return
 
 
-img2img_tab_tracker = Img2ImgTabTracker()
 script_callbacks.on_ui_settings(on_ui_settings)
-script_callbacks.on_after_component(img2img_tab_tracker.on_after_component_callback)
 script_callbacks.on_after_component(on_after_component)
