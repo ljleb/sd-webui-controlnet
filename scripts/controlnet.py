@@ -135,12 +135,14 @@ class UiControlNetUnit(external_code.ControlNetUnit):
         self,
         input_mode: InputMode=InputMode.SIMPLE,
         batch_images: Optional[Union[str, List[external_code.InputImage]]]=None,
+        feed_last_image: bool=False,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.is_ui = True
         self.input_mode = input_mode
         self.batch_images = batch_images
+        self.feed_last_image = feed_last_image
 
 
 class Script(scripts.Script):
@@ -159,6 +161,7 @@ class Script(scripts.Script):
         self.img2img_h_slider = gr.Slider()
         self.current_batch_index = 0
         self.forward_params = []
+        self.detected_map = []
 
         def submit_callback(_id):
             self.current_batch_index = 0
@@ -209,6 +212,7 @@ class Script(scripts.Script):
 
                 with gr.Tab(label='Batch') as batch_tab:
                     batch_image_dir = gr.Textbox(label='Input directory', placeholder='Leave empty to use img2img batch controlnet input directory')
+                    feed_last_image = gr.Checkbox(label='Feed last generated image back into this unit')
 
         with gr.Row():
             gr.HTML(value='<p>Invert colors if your image has white background.<br >Change your brush width to make it thinner if you want to draw something.<br ></p>')
@@ -419,7 +423,7 @@ class Script(scripts.Script):
         input_mode = gr.State(InputMode.SIMPLE)
         input_image = gr.State()
         batch_image_dir_state = gr.State('')
-        unit_args = (input_mode, batch_image_dir_state, enabled, module, model, weight, input_image, scribble_mode, resize_mode, rgbbgr_mode, lowvram, processor_res, threshold_a, threshold_b, guidance_start, guidance_end, guess_mode)
+        unit_args = (input_mode, batch_image_dir_state, feed_last_image, enabled, module, model, weight, input_image, scribble_mode, resize_mode, rgbbgr_mode, lowvram, processor_res, threshold_a, threshold_b, guidance_start, guidance_end, guess_mode)
         self.register_modules(tabname, unit_args)
 
         upload_image.orgpreprocess=upload_image.preprocess
@@ -688,6 +692,10 @@ class Script(scripts.Script):
     def is_ui(self, args):
         return args and all(isinstance(arg, UiControlNetUnit) for arg in args)
 
+    def is_img2img_batch_tab(self, args):
+        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
+        return self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
+
     def normalize_to_batch_mode(self, units: List[external_code.ControlNetUnit]) -> Tuple[List[external_code.ControlNetUnit], int]:
         if not units:
             return units, 1
@@ -718,12 +726,10 @@ class Script(scripts.Script):
 
         return units, batch_size
 
-    def compute_control_map(self, p, unit, preprocessor, batch_image, detected_maps, idx):
+    def compute_control_map(self, p, args, unit, preprocessor, batch_image, idx):
         p_input_image = self.get_remote_call(p, "control_net_input_image", None, idx)
         resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
         invert_image = unit.invert_image
-        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
-        is_img2img_batch_tab = is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
 
         batch_image = image_dict_from_any(batch_image)
 
@@ -731,7 +737,7 @@ class Script(scripts.Script):
             while len(batch_image['mask'].shape) < 3:
                 batch_image['mask'] = batch_image['mask'][..., np.newaxis]
 
-        if is_img2img_batch_tab and getattr(p, "image_control", None) is not None:
+        if self.is_img2img_batch_tab(args) and getattr(p, "image_control", None) is not None:
             input_image = HWC3(np.asarray(p.image_control))
         elif p_input_image is not None:
             input_image = HWC3(np.asarray(p_input_image))
@@ -756,8 +762,7 @@ class Script(scripts.Script):
                 raise ValueError('controlnet is enabled but no input image is given')
             input_image = HWC3(np.asarray(input_image))
 
-        if issubclass(type(p),
-                      StableDiffusionProcessingImg2Img) and p.inpaint_full_res == True and p.image_mask is not None:
+        if issubclass(type(p), StableDiffusionProcessingImg2Img) and p.inpaint_full_res == True and p.image_mask is not None:
             input_image = Image.fromarray(input_image)
             mask = p.image_mask.convert('L')
             crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
@@ -773,15 +778,13 @@ class Script(scripts.Script):
             input_image = detected_map
 
         if unit.processor_res > 64:
-            detected_map, is_image = preprocessor(input_image, res=unit.processor_res, thr_a=unit.threshold_a,
-                                                  thr_b=unit.threshold_b)
+            detected_map, is_image = preprocessor(input_image, res=unit.processor_res, thr_a=unit.threshold_a, thr_b=unit.threshold_b)
         else:
             detected_map, is_image = preprocessor(input_image)
 
         if is_image:
-            control, detected_map = self.detectmap_proc(detected_map, unit.module, unit.rgbbgr_mode, resize_mode,
-                                                        p.height, p.width)
-            detected_maps.append((detected_map, unit.module))
+            control, detected_map = self.detectmap_proc(detected_map, unit.module, unit.rgbbgr_mode, resize_mode, p.height, p.width)
+            self.detected_map.append((detected_map, unit.module))
         else:
             control = detected_map
 
@@ -793,9 +796,6 @@ class Script(scripts.Script):
         You can modify the processing object (p) here, inject hooks, etc.
         args contains all values returned by components from ui()
         """
-        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
-        is_img2img_batch_tab = self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
-
         unet = p.sd_model.model.diffusion_model
         if self.latest_network is not None:
             # always restore (~0.05s)
@@ -831,7 +831,7 @@ class Script(scripts.Script):
 
         enabled_units, cn_batch_size = self.normalize_to_batch_mode(enabled_units)
         if self.current_batch_index == 0:
-            if not is_img2img_batch_tab:
+            if not self.is_img2img_batch_tab(args):
                 p.n_iter *= cn_batch_size
                 p.all_prompts *= cn_batch_size
                 p.all_negative_prompts *= cn_batch_size
@@ -842,10 +842,8 @@ class Script(scripts.Script):
            self.latest_network = None
            return 
 
-        detected_maps = []
-        self.forward_params.clear()
         hook_lowvram = False
-        
+
         # cache stuff
         if self.latest_model_hash != p.sd_model.sd_model_hash:
             self.clear_control_model_cache()
@@ -854,63 +852,77 @@ class Script(scripts.Script):
         module_list = [unit.module for unit in enabled_units]
         for key in self.unloadable:
             if key not in module_list:
-                self.unloadable.get(unit.module, lambda:None)()
+                self.unloadable.get(key, lambda:None)()
 
         self.latest_model_hash = p.sd_model.sd_model_hash
-        for idx, unit in enumerate(enabled_units):
-            if unit.low_vram:
-                hook_lowvram = True
+        if self.current_batch_index == 0:
+            self.detected_map.clear()
+            self.forward_params.clear()
+            for idx, unit in enumerate(enabled_units):
+                if unit.low_vram:
+                    hook_lowvram = True
 
-            model_net = self.load_control_model(p, unet, unit.model, unit.low_vram)
-            model_net.reset()
+                model_net = self.load_control_model(p, unet, unit.model, unit.low_vram)
+                model_net.reset()
 
-            print(f"Loading preprocessor: {unit.module}")
-            preprocessor = self.preprocessor[unit.module]
+                forward_param = ControlParams(
+                    control_model=model_net,
+                    hint_cond=None,
+                    guess_mode=unit.guess_mode,
+                    weight=unit.weight,
+                    guidance_stopped=False,
+                    start_guidance_percent=unit.guidance_start,
+                    stop_guidance_percent=unit.guidance_end,
+                    advanced_weighting=None,
+                    is_adapter=isinstance(model_net, PlugableAdapter),
+                    is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter",
+                )
+                self.forward_params.append(forward_param)
 
-            control_maps = []
-            if is_img2img_batch_tab:
-                control_map = self.compute_control_map(p, unit, preprocessor, unit.batch_images[self.current_batch_index], detected_maps, idx)
-                control_maps.append(control_map)
-            else:
-                for batch_image in unit.batch_images:
-                    control_map = self.compute_control_map(p, unit, preprocessor, batch_image, detected_maps, idx)
-                    control_maps.append(control_map)
+                del model_net
 
-            forward_param = ControlParams(
-                control_model=model_net,
-                hint_cond=control_maps[0],
-                guess_mode=unit.guess_mode,
-                weight=unit.weight,
-                guidance_stopped=False,
-                start_guidance_percent=unit.guidance_start,
-                stop_guidance_percent=unit.guidance_end,
-                advanced_weighting=None,
-                is_adapter=isinstance(model_net, PlugableAdapter),
-                is_extra_cond=getattr(model_net, "target", "") == "scripts.adapter.StyleAdapter",
-                all_hint_conds=control_maps,
-            )
-            self.forward_params.append(forward_param)
-
-            del model_net
-
-        self.latest_network = UnetHook(lowvram=hook_lowvram)    
-        self.latest_network.hook(unet)
-        self.latest_network.notify(list(self.forward_params), p.sampler_name in ["DDIM", "PLMS", "UniPC"])
-        self.detected_map = detected_maps
+            self.latest_network = UnetHook(lowvram=hook_lowvram)
+            self.latest_network.hook(unet)
+            self.latest_network.notify(list(self.forward_params), p.sampler_name in ["DDIM", "PLMS", "UniPC"])
 
         if len(enabled_units) > 0 and shared.opts.data.get("control_net_skip_img2img_processing") and hasattr(p, "init_images"):
             swap_img2img_pipeline(p)
 
     def before_process_batch(self, p, *args, **kwargs):
         batch_i = kwargs['batch_number']
-        for param in self.forward_params:
-            param.hint_cond = param.all_hint_conds[batch_i % len(param.all_hint_conds)]
+        units = external_code.get_all_units_from(args)
+        enabled_units = [unit for unit in units if unit.enabled]
+        enabled_units, cn_unit_batch_size = self.normalize_to_batch_mode(enabled_units)
+
+        batch_image_i = (self.current_batch_index % cn_unit_batch_size) if self.is_img2img_batch_tab(args) else batch_i
+        for i, unit in enumerate(enabled_units):
+            if getattr(unit, 'feed_last_image', False) and batch_image_i > 0:
+                continue
+
+            param = self.forward_params[i]
+            print(f"Loading preprocessor: {unit.module}")
+            preprocessor = self.preprocessor[unit.module]
+            control_map = self.compute_control_map(p, args, unit, preprocessor, unit.batch_images[batch_image_i % len(unit.batch_images)], i)
+            param.hint_cond = control_map
+
+    def postprocess_batch(self, p, *args, **kwargs):
+        units = external_code.get_all_units_from(args)
+        enabled_units = [unit for unit in units if unit.enabled]
+        enabled_units, _ = self.normalize_to_batch_mode(enabled_units)
+        feed_back_units = ((i, unit) for i, unit in enumerate(enabled_units) if getattr(unit, 'feed_last_image', False))
+        last_image = rearrange(kwargs['images'][0] * 255, 'c h w -> h w c').numpy().astype(np.uint8)
+
+        for i, unit in feed_back_units:
+            param = self.forward_params[i]
+            print(f"Loading preprocessor: {unit.module}")
+            preprocessor = self.preprocessor[unit.module]
+            control_map = self.compute_control_map(p, args, unit, preprocessor, last_image, i)
+            param.hint_cond = control_map
 
     def postprocess(self, p, processed, *args):
-        self.forward_params.clear()
         if shared.opts.data.get("control_net_detectmap_autosaving", False) and self.latest_network is not None:
             for detect_map, module in self.detected_map:
-                detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir", False), module)
+                detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir"), module)
                 if not os.path.isabs(detectmap_dir):
                     detectmap_dir = os.path.join(p.outpath_samples, detectmap_dir)
                 if module != "none":
@@ -918,12 +930,12 @@ class Script(scripts.Script):
                     img = Image.fromarray(detect_map)
                     save_image(img, detectmap_dir, module)
 
-        is_img2img = img2img_tab_tracker.submit_button == 'img2img_generate'
-        if is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab':
+        if self.is_img2img_batch_tab(args):
+            self.detected_map.clear()
             self.current_batch_index += 1
+            return
 
-        is_img2img_batch_tab = self.is_ui(args) and is_img2img and img2img_tab_tracker.submit_img2img_tab == 'img2img_batch_tab'
-        if self.latest_network is None or is_img2img_batch_tab:
+        if self.latest_network is None:
             return
 
         no_detectmap_opt = shared.opts.data.get("control_net_no_detectmap", False)
@@ -938,6 +950,8 @@ class Script(scripts.Script):
         self.input_image = None
         self.latest_network.restore(p.sd_model.model.diffusion_model)
         self.latest_network = None
+        self.detected_map.clear()
+        self.forward_params.clear()
 
         gc.collect()
         devices.torch_gc()

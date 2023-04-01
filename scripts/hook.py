@@ -42,7 +42,7 @@ class ControlParams:
     def __init__(
         self, 
         control_model, 
-        hint_cond, 
+        hint_cond,
         guess_mode, 
         weight, 
         guidance_stopped,
@@ -51,7 +51,6 @@ class ControlParams:
         advanced_weighting, 
         is_adapter,
         is_extra_cond,
-        all_hint_conds=None,
     ):
         self.control_model = control_model
         self.hint_cond = hint_cond
@@ -63,7 +62,6 @@ class ControlParams:
         self.advanced_weighting = advanced_weighting
         self.is_adapter = is_adapter
         self.is_extra_cond = is_extra_cond
-        self.all_hint_conds = all_hint_conds if all_hint_conds is not None else [hint_cond]
 
 
 class UnetHook(nn.Module):
