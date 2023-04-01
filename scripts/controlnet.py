@@ -129,10 +129,28 @@ def process_batch_hijack(*args, **kwargs):
     global img2img_batch_index, is_img2img_batch
     img2img_batch_index = 0
     is_img2img_batch = True
+
+    def img2img_scripts_run_hijack(*args, **kwargs):
+        global img2img_batch_index
+        res = original_img2img_scripts_run(*args, **kwargs)
+        img2img_batch_index += 1
+        return res
+
+    original_img2img_scripts_run = scripts.scripts_img2img.run
+    scripts.scripts_img2img.run = img2img_scripts_run_hijack
+
     try:
         return getattr(img2img, '__controlnet_original_process_batch')(*args, **kwargs)
     finally:
+        scripts.scripts_img2img.run = original_img2img_scripts_run
         is_img2img_batch = False
+        cn_scripts = (external_code.find_cn_script(script_runner) for script_runner in (scripts.scripts_img2img, scripts.scripts_txt2img))
+        cn_scripts = [cn_script for cn_script in cn_scripts if cn_script is not None]
+        for cn_script in cn_scripts:
+            cn_script.input_image = None
+            if cn_script.latest_network is not None:
+                cn_script.latest_network.restore(shared.sd_model.model.diffusion_model)
+                cn_script.latest_network = None
 
 
 img2img_batch_index = 0
@@ -908,7 +926,8 @@ class Script(scripts.Script):
             param = self.forward_params[i]
             print(f"Loading preprocessor: {unit.module}")
             preprocessor = self.preprocessor[unit.module]
-            control_map = self.compute_control_map(p, args, unit, preprocessor, unit.batch_images[batch_image_i % len(unit.batch_images)], i)
+            batch_image = unit.batch_images[batch_image_i % len(unit.batch_images)]
+            control_map = self.compute_control_map(p, args, unit, preprocessor, batch_image, i)
             param.hint_cond = control_map
 
     def postprocess_batch(self, p, *args, **kwargs):
@@ -926,10 +945,6 @@ class Script(scripts.Script):
             param.hint_cond = control_map
 
     def postprocess(self, p, processed, *args):
-        units = external_code.get_all_units_from(args)
-        enabled_units = [unit for unit in units if unit.enabled]
-        enabled_units, cn_unit_batch_size = self.normalize_to_batch_mode(enabled_units)
-
         if shared.opts.data.get("control_net_detectmap_autosaving", False) and self.latest_network is not None:
             for detect_map, module in self.detected_map:
                 detectmap_dir = os.path.join(shared.opts.data.get("control_net_detectedmap_dir"), module)
@@ -940,12 +955,9 @@ class Script(scripts.Script):
                     img = Image.fromarray(detect_map)
                     save_image(img, detectmap_dir, module)
 
-        global img2img_batch_index
+        global is_img2img_batch
         if is_img2img_batch:
             self.detected_map.clear()
-            img2img_batch_index += 1
-            if img2img_batch_index >= cn_unit_batch_size:
-                self.forward_params.clear()
             return
 
         self.forward_params.clear()
