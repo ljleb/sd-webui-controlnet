@@ -152,7 +152,6 @@ def img2img_process_batch_hijack(*args, **kwargs):
     img2img_process_batch_tab()
 
     def img2img_scripts_run_hijack(*args, **kwargs):
-        global img2img_batch_index
         res = original_img2img_scripts_run(*args, **kwargs)
         img2img_postprocess_batch_tab_each()
         return res
