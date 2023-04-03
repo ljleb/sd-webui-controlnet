@@ -66,6 +66,7 @@ img2img.process_batch = img2img_process_batch_hijack
 
 T = TypeVar('T')
 
+
 @dataclasses.dataclass
 class GrowingCircularBuffer(Generic[T]):
     buffer: List[T] = dataclasses.field(default_factory=list)
@@ -98,8 +99,7 @@ class BatchLoopbackScript(scripts.Script):
     def __init__(self):
         self.is_img2img_batch = False
         self.output_images = GrowingCircularBuffer()
-        self.init_latent = None
-        self.increment_img2img_batch_seed = (False, False)
+        self.source_latent = None
         self.seed = -1
         self.subseed = -1
 
@@ -117,30 +117,32 @@ class BatchLoopbackScript(scripts.Script):
 
     def ui(self, is_img2img):
         if not is_img2img:
-            return [gr.State(0.), gr.State(1.), gr.State(False)]
-
-        self.increment_img2img_batch_seed = (True, self.increment_img2img_batch_seed[1])
+            return [
+                gr.State(False), gr.State(False),
+                gr.State(0.), gr.State(1.), gr.State(False)
+            ]
 
         extension_name = 'batch_loopback'
         def format_elem_id(name):
             return f'{extension_name}_{name}'
 
         def label_space_fix(label):
-            # extra space fixes broken maximum for some reason -_-
+            # extra space fixes broken maximum and default values for some reason -_-
             # also fixes checkboxes default values
             return f'{label} '
 
         with gr.Accordion(label='Batch Loopback', open=False, elem_id=extension_name):
-            enabled = gr.Checkbox(
+            enable = gr.Checkbox(
                 label='Enable',
                 value=False,
                 elem_id=f'{extension_name}_enable',
             )
+
             with gr.Row():
                 with gr.Column(scale=3):
                     loopback_mix = gr.Slider(
-                        label='Loopback mix',
-                        value=0.,
+                        label=label_space_fix('Loopback mix'),
+                        value=1.,
                         minimum=0.,
                         maximum=1.,
                         step=.01,
@@ -154,7 +156,7 @@ class BatchLoopbackScript(scripts.Script):
                         minimum=0.,
                         maximum=1.,
                         step=.01,
-                        interactive=False,
+                        interactive=True,
                         elem_id=format_elem_id('wet_mix'),
                     )
 
@@ -169,81 +171,74 @@ class BatchLoopbackScript(scripts.Script):
                         outputs=[wet_mix],
                     )
 
-            def block():
-                increment_seed = gr.Checkbox(
-                    label='Increment seed in img2img batch tab',
-                    value=self.increment_img2img_batch_seed[0],
-                    elem_id=format_elem_id('increment_seed'),
-                )
-                increment_seed.change(fn=self.__update_increment_seed, inputs=increment_seed)
-            block()
+            increment_seed = gr.Checkbox(
+                label='Increment seed in img2img batch tab',
+                value=True,
+                elem_id=format_elem_id('increment_seed'),
+            )
 
-        return [enabled, loopback_mix, wet_mix, follow_loopback_mix]
+        return [enable, increment_seed, loopback_mix, wet_mix, follow_loopback_mix]
 
-    def __update_increment_seed(self, new_value):
-        self.increment_img2img_batch_seed = (new_value, self.increment_img2img_batch_seed[1])
-
-    def process(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix):
+    def process(self, p, enable, increment_seed, loopback_mix, wet_mix, follow_loopback_mix):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not enabled: return
+        if not enable: return
 
         if not self.is_img2img_batch:
             self.output_images.clear()
 
-    def process_batch(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
+    def process_batch(self, p, enable, increment_seed, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not enabled: return
+        if not enable: return
+
         if self.is_img2img_batch:
             if not self.output_images.size_locked: return
 
         else:
             if not self.output_images: return
 
-            self.init_latent = p.init_latent
+            self.source_latent = p.init_latent
 
         if follow_loopback_mix:
             wet_mix = loopback_mix
 
         last_latent = self.__to_latent(p, self.output_images.get_current())
-        feedback_latent = self.init_latent * (1. - wet_mix) + last_latent * wet_mix
+        feedback_latent = self.source_latent * (1. - wet_mix) + last_latent * wet_mix
         p.init_latent = p.init_latent * (1. - loopback_mix) + feedback_latent * loopback_mix
 
-    def postprocess_batch(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
+    def postprocess_batch(self, p, enable, increment_seed, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not enabled: return
+        if not enable: return
 
-        images = [torchvision.transforms.ToPILImage()(image) for image in kwargs['images']]
-        self.output_images.append(images)
+        self.output_images.append(kwargs['images'])
         if not self.is_img2img_batch:
             self.output_images.lock_size()
-            p.init_latent = self.init_latent
 
-    def postprocess(self, p, processed, enabled, loopback_mix, wet_mix, follow_loopback_mix):
+    def postprocess(self, p, processed, enable, increment_seed, loopback_mix, wet_mix, follow_loopback_mix):
+        if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
+        if not enable: return
+
         if not self.is_img2img_batch:
             self.output_images.clear()
 
     def __to_latent(self, p, images):
-        to_stack = []
-        for image in images:
-            image = numpy.array(image).astype(numpy.float32) / 255.0
-            image = numpy.moveaxis(image, 2, 0)
-            to_stack.append(image)
-
-        stacked_images = 2. * torch.from_numpy(numpy.array(to_stack)).to(shared.device) - 1.
+        images = 2. * images.to(device=shared.device) - 1.
         with devices.autocast():
-            return p.sd_model.get_first_stage_encoding(p.sd_model.encode_first_stage(stacked_images))
+            return p.sd_model.get_first_stage_encoding(p.sd_model.encode_first_stage(images))
 
     def img2img_process_batch_tab(self, p):
+        if not self.find_script_args(p)[0]: return
         self.is_img2img_batch = True
         self.output_images.clear()
-        self.init_latent = None
-        self.increment_img2img_batch_seed = (self.increment_img2img_batch_seed[0], self.increment_img2img_batch_seed[0])
+        self.source_latent = None
         self.seed = p.seed
         self.subseed = p.subseed
 
     def img2img_process_batch_tab_each(self, p):
-        self.init_latent = p.init_latent
-        if self.increment_img2img_batch_seed[1]:
+        script_args = self.find_script_args(p)
+        if not script_args[0]: return
+
+        self.source_latent = p.init_latent
+        if script_args[1]:
             if self.seed != -1:
                 self.seed += p.n_iter
             p.seed = self.seed
@@ -252,10 +247,21 @@ class BatchLoopbackScript(scripts.Script):
             p.subseed = self.subseed
 
     def img2img_postprocess_batch_tab_each(self, p):
+        if not self.find_script_args(p)[0]: return
         self.output_images.lock_size()
-        self.init_latent = None
+        self.source_latent = None
 
     def img2img_postprocess_batch_tab(self, p):
+        if not self.find_script_args(p)[0]: return
         self.is_img2img_batch = False
         self.output_images.clear()
-        self.init_latent = None
+        self.source_latent = None
+
+    def find_script_args(self, p):
+        if not p.scripts.alwayson_scripts: return [False, False]
+
+        for script in p.scripts.alwayson_scripts:
+            if script.title().lower() == 'batch loopback':
+                break
+
+        return p.script_args[script.args_from:script.args_to]
