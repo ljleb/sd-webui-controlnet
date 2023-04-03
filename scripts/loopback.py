@@ -122,7 +122,20 @@ class BatchLoopbackScript(scripts.Script):
         self.increment_img2img_batch_seed = (True, self.increment_img2img_batch_seed[1])
 
         extension_name = 'batch_loopback'
+        def format_elem_id(name):
+            return f'{extension_name}_{name}'
+
+        def label_space_fix(label):
+            # extra space fixes broken maximum for some reason -_-
+            # also fixes checkboxes default values
+            return f'{label} '
+
         with gr.Accordion(label='Batch Loopback', open=False, elem_id=extension_name):
+            enabled = gr.Checkbox(
+                label='Enable',
+                value=False,
+                elem_id=f'{extension_name}_enable',
+            )
             with gr.Row():
                 with gr.Column(scale=3):
                     loopback_mix = gr.Slider(
@@ -131,23 +144,24 @@ class BatchLoopbackScript(scripts.Script):
                         minimum=0.,
                         maximum=1.,
                         step=.01,
-                        elem_id=f'{extension_name}_mix',
+                        elem_id=format_elem_id('loopback_mix'),
                     )
 
                 with gr.Column(min_width=160):
                     wet_mix = gr.Slider(
-                        label='Wet mix ', # extra space fixes broken maximum for some reason -_-
+                        label=label_space_fix('Wet mix'),
                         value=1.,
                         minimum=0.,
                         maximum=1.,
                         step=.01,
-                        elem_id=f'{extension_name}_wet_mix',
+                        interactive=False,
+                        elem_id=format_elem_id('wet_mix'),
                     )
 
                     follow_loopback_mix = gr.Checkbox(
-                        label='Follow loopback mix',
-                        value=False,
-                        elem_id=f'{extension_name}_follow_loopback_mix',
+                        label=label_space_fix('Follow loopback mix'),
+                        value=not wet_mix.interactive,
+                        elem_id=format_elem_id('follow_loopback_mix'),
                     )
                     follow_loopback_mix.change(
                         fn=lambda a: gr.Slider.update(interactive=not a),
@@ -159,26 +173,26 @@ class BatchLoopbackScript(scripts.Script):
                 increment_seed = gr.Checkbox(
                     label='Increment seed in img2img batch tab',
                     value=self.increment_img2img_batch_seed[0],
-                    elem_id=f'{extension_name}_increment_seed',
+                    elem_id=format_elem_id('increment_seed'),
                 )
                 increment_seed.change(fn=self.__update_increment_seed, inputs=increment_seed)
             block()
 
-        return [loopback_mix, wet_mix, follow_loopback_mix]
+        return [enabled, loopback_mix, wet_mix, follow_loopback_mix]
 
     def __update_increment_seed(self, new_value):
         self.increment_img2img_batch_seed = (new_value, self.increment_img2img_batch_seed[1])
 
-    def process(self, p, loopback_mix, wet_mix, follow_loopback_mix):
+    def process(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not loopback_mix: return
+        if not enabled: return
 
         if not self.is_img2img_batch:
             self.output_images.clear()
 
-    def process_batch(self, p, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
+    def process_batch(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not loopback_mix: return
+        if not enabled: return
         if self.is_img2img_batch:
             if not self.output_images.size_locked: return
 
@@ -194,9 +208,9 @@ class BatchLoopbackScript(scripts.Script):
         feedback_latent = self.init_latent * (1. - wet_mix) + last_latent * wet_mix
         p.init_latent = p.init_latent * (1. - loopback_mix) + feedback_latent * loopback_mix
 
-    def postprocess_batch(self, p, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
+    def postprocess_batch(self, p, enabled, loopback_mix, wet_mix, follow_loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
-        if not loopback_mix: return
+        if not enabled: return
 
         images = [torchvision.transforms.ToPILImage()(image) for image in kwargs['images']]
         self.output_images.append(images)
@@ -204,7 +218,7 @@ class BatchLoopbackScript(scripts.Script):
             self.output_images.lock_size()
             p.init_latent = self.init_latent
 
-    def postprocess(self, p, processed, loopback_mix, wet_mix, follow_loopback_mix):
+    def postprocess(self, p, processed, enabled, loopback_mix, wet_mix, follow_loopback_mix):
         if not self.is_img2img_batch:
             self.output_images.clear()
 
