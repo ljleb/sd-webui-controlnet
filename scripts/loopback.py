@@ -1,5 +1,5 @@
 import dataclasses
-from typing import List
+from typing import List, Optional, Iterable, TypeVar, Generic
 
 import numpy
 import torch
@@ -64,16 +64,18 @@ setattr(img2img, '__batch_loopback_original_process_batch', img2img.process_batc
 img2img.process_batch = img2img_process_batch_hijack
 
 
+T = TypeVar('T')
+
 @dataclasses.dataclass
-class GrowingCircularBuffer:
-    buffer: List[List[Image.Image]] = dataclasses.field(default_factory=list)
+class GrowingCircularBuffer(Generic[T]):
+    buffer: List[T] = dataclasses.field(default_factory=list)
     current_index: int = 0
     size_locked: bool = False
 
-    def lock_size(self, lock=True):
+    def lock_size(self, lock: bool=True):
         self.size_locked = lock
 
-    def append(self, value):
+    def append(self, value: T):
         if self.size_locked:
             self.buffer[self.current_index % len(self.buffer)] = value
         else:
@@ -85,7 +87,7 @@ class GrowingCircularBuffer:
         for k, v in GrowingCircularBuffer().__dict__.items():
             setattr(self, k, v)
 
-    def get_current(self):
+    def get_current(self) -> T:
         return self.buffer[(self.current_index - 1) % len(self.buffer)]
 
     def __bool__(self):
@@ -98,6 +100,9 @@ class BatchLoopbackScript(scripts.Script):
         self.output_images = GrowingCircularBuffer()
         self.init_latent = None
         self.init_images = None
+        self.increment_img2img_batch_seed = False
+        self.seed = -1
+        self.subseed = -1
 
         global img2img_process_batch_tab_callbacks, img2img_process_batch_tab_each_callbacks, img2img_postprocess_batch_tab_each_callbacks, img2img_postprocess_batch_tab_callbacks
         img2img_process_batch_tab_callbacks.append(self.img2img_process_batch_tab)
@@ -113,7 +118,9 @@ class BatchLoopbackScript(scripts.Script):
 
     def ui(self, is_img2img):
         if not is_img2img:
-            return [gr.State(0.0)]
+            return [gr.State(.0)]
+
+        self.increment_img2img_batch_seed = True
 
         with gr.Accordion(label='Batch Loopback', open=False, elem_id='batch_loopback'):
             loopback_mix = gr.Slider(
@@ -123,8 +130,17 @@ class BatchLoopbackScript(scripts.Script):
                 maximum=1.0,
                 step=0.01,
                 elem_id='batch_loopback_mix')
+            increment_seed = gr.Checkbox(
+                label='Increment seed in img2img batch tab',
+                value=self.increment_img2img_batch_seed,
+                elem_id='batch_loopback_increment_seed',
+            )
+            increment_seed.change(fn=self.__update_increment_seed, inputs=increment_seed)
 
         return [loopback_mix]
+
+    def __update_increment_seed(self, new_value):
+        self.increment_img2img_batch_seed = new_value
 
     def process(self, p, loopback_mix):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
@@ -145,18 +161,8 @@ class BatchLoopbackScript(scripts.Script):
             self.init_latent = p.init_latent
             self.init_images = list(p.init_images)
 
-        last_output = self.output_images.get_current()
-
-        with devices.autocast():
-            to_stack = []
-            for image in last_output:
-                image = numpy.array(image).astype(numpy.float32) / 255.0
-                image = numpy.moveaxis(image, 2, 0)
-                to_stack.append(image)
-
-            last_latent = 2. * torch.from_numpy(numpy.array(to_stack)).to(shared.device) - 1.
-            last_latent = p.sd_model.get_first_stage_encoding(p.sd_model.encode_first_stage(last_latent))
-            p.init_latent = p.init_latent * (1.0 - loopback_mix) + last_latent * loopback_mix
+        last_latent = self.__to_latent(p, self.output_images.get_current())
+        p.init_latent = p.init_latent * (1.0 - loopback_mix) + last_latent * loopback_mix
 
     def postprocess_batch(self, p, loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
@@ -171,6 +177,17 @@ class BatchLoopbackScript(scripts.Script):
         if not self.is_img2img_batch:
             self.output_images.clear()
 
+    def __to_latent(self, p, images):
+        to_stack = []
+        for image in images:
+            image = numpy.array(image).astype(numpy.float32) / 255.0
+            image = numpy.moveaxis(image, 2, 0)
+            to_stack.append(image)
+
+        stacked_images = 2. * torch.from_numpy(numpy.array(to_stack)).to(shared.device) - 1.
+        with devices.autocast():
+            return p.sd_model.get_first_stage_encoding(p.sd_model.encode_first_stage(stacked_images))
+
     def img2img_process_batch_tab(self, p):
         self.is_img2img_batch = True
         self.output_images.clear()
@@ -182,12 +199,13 @@ class BatchLoopbackScript(scripts.Script):
     def img2img_process_batch_tab_each(self, p):
         self.init_latent = p.init_latent
         self.init_images = p.init_images
-        if self.seed != -1:
-            self.seed += p.n_iter
-        p.seed = self.seed
-        if self.subseed != -1:
-            self.subseed += p.n_iter
-        p.subseed = self.subseed
+        if self.increment_img2img_batch_seed:
+            if self.seed != -1:
+                self.seed += p.n_iter
+            p.seed = self.seed
+            if self.subseed != -1:
+                self.subseed += p.n_iter
+            p.subseed = self.subseed
 
     def img2img_postprocess_batch_tab_each(self, p):
         self.output_images.lock_size()
