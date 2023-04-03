@@ -14,15 +14,13 @@ img2img_postprocess_batch_tab_each_callbacks = []
 img2img_postprocess_batch_tab_callbacks = []
 
 
-def img2img_process_batch_hijack(*args, **kwargs):
+def img2img_process_batch_hijack(p, *args, **kwargs):
     for callback in img2img_process_batch_tab_callbacks:
-        callback()
+        callback(p)
 
     res_was_none = False
-    p = None
-    def img2img_scripts_run_hijack(pp, *args):
-        nonlocal res_was_none, p
-        p = pp
+    def img2img_scripts_run_hijack(p, *args):
+        nonlocal res_was_none
         if res_was_none:
             for callback in img2img_postprocess_batch_tab_each_callbacks:
                 callback(p)
@@ -43,7 +41,7 @@ def img2img_process_batch_hijack(*args, **kwargs):
     scripts.scripts_img2img.run = img2img_scripts_run_hijack
 
     try:
-        return getattr(img2img, '__batch_loopback_original_process_batch')(*args, **kwargs)
+        return getattr(img2img, '__batch_loopback_original_process_batch')(p, *args, **kwargs)
     finally:
         if res_was_none:
             for callback in img2img_postprocess_batch_tab_each_callbacks:
@@ -51,7 +49,7 @@ def img2img_process_batch_hijack(*args, **kwargs):
 
         scripts.scripts_img2img.run = original_img2img_scripts_run
         for callback in img2img_postprocess_batch_tab_callbacks:
-            callback()
+            callback(p)
 
 
 if hasattr(img2img, '__batch_loopback_original_process_batch'):
@@ -129,10 +127,9 @@ class BatchLoopbackScript(scripts.Script):
                 image = numpy.moveaxis(image, 2, 0)
                 to_stack.append(image)
 
-            last_latent = 2. * torch.stack(to_stack).to(shared.device) - 1.
+            last_latent = 2. * torch.from_numpy(numpy.array(to_stack)).to(shared.device) - 1.
             last_latent = shared.sd_model.get_first_stage_encoding(shared.sd_model.encode_first_stage(last_latent))
             p.init_latent = p.init_latent * (1.0 - loopback_mix) + last_latent * loopback_mix
-        pass
 
     def postprocess_batch(self, p, loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
@@ -151,16 +148,15 @@ class BatchLoopbackScript(scripts.Script):
             self.output_images.clear()
             self.last_output_index = 0
 
-        self.seed = p.seed
-        self.subseed = p.subseed
-
-    def img2img_process_batch_tab(self):
+    def img2img_process_batch_tab(self, p):
         self.img2img_batch_index = 0
         self.is_img2img_batch = True
         self.output_images.clear()
         self.init_latent = None
         self.init_images = None
         self.grow_last_images = True
+        self.seed = p.seed
+        self.subseed = p.subseed
 
     def img2img_process_batch_tab_each(self, p):
         self.last_output_index = 0
@@ -175,7 +171,7 @@ class BatchLoopbackScript(scripts.Script):
         self.init_latent = None
         self.init_images = None
 
-    def img2img_postprocess_batch_tab(self):
+    def img2img_postprocess_batch_tab(self, p):
         self.img2img_batch_index = 0
         self.is_img2img_batch = False
         self.output_images.clear()
