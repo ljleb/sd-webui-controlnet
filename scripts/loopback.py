@@ -99,8 +99,7 @@ class BatchLoopbackScript(scripts.Script):
         self.is_img2img_batch = False
         self.output_images = GrowingCircularBuffer()
         self.init_latent = None
-        self.init_images = None
-        self.increment_img2img_batch_seed = False
+        self.increment_img2img_batch_seed = (False, False)
         self.seed = -1
         self.subseed = -1
 
@@ -118,38 +117,54 @@ class BatchLoopbackScript(scripts.Script):
 
     def ui(self, is_img2img):
         if not is_img2img:
-            return [gr.State(.0)]
+            return [gr.State(0.), gr.State(1.)]
 
-        self.increment_img2img_batch_seed = True
+        self.increment_img2img_batch_seed = (True, self.increment_img2img_batch_seed[1])
 
         with gr.Accordion(label='Batch Loopback', open=False, elem_id='batch_loopback'):
-            loopback_mix = gr.Slider(
-                label='Loopback mix',
-                value=0.0,
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                elem_id='batch_loopback_mix')
-            increment_seed = gr.Checkbox(
-                label='Increment seed in img2img batch tab',
-                value=self.increment_img2img_batch_seed,
-                elem_id='batch_loopback_increment_seed',
-            )
-            increment_seed.change(fn=self.__update_increment_seed, inputs=increment_seed)
+            with gr.Row():
+                with gr.Column(scale=3):
+                    loopback_mix = gr.Slider(
+                        label='Loopback mix',
+                        value=0.,
+                        minimum=0.,
+                        maximum=1.,
+                        step=.01,
+                        elem_id='batch_loopback_mix',
+                    )
 
-        return [loopback_mix]
+                with gr.Column(min_width=160):
+                    wet_mix = gr.Slider(
+                        label='Wet mix ', # extra space fixes broken maximum for some reason -_-
+                        value=1.,
+                        minimum=0.,
+                        maximum=1.,
+                        step=.01,
+                        elem_id='batch_loopback_wet_mix',
+                    )
+
+            def block():
+                increment_seed = gr.Checkbox(
+                    label='Increment seed in img2img batch tab',
+                    value=self.increment_img2img_batch_seed[0],
+                    elem_id='batch_loopback_increment_seed',
+                )
+                increment_seed.change(fn=self.__update_increment_seed, inputs=increment_seed)
+            block()
+
+        return [loopback_mix, wet_mix]
 
     def __update_increment_seed(self, new_value):
-        self.increment_img2img_batch_seed = new_value
+        self.increment_img2img_batch_seed = (new_value, self.increment_img2img_batch_seed[1])
 
-    def process(self, p, loopback_mix):
+    def process(self, p, loopback_mix, wet_mix):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
 
         if not self.is_img2img_batch:
             self.output_images.clear()
 
-    def process_batch(self, p, loopback_mix, **kwargs):
+    def process_batch(self, p, loopback_mix, wet_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
         if self.is_img2img_batch:
@@ -159,12 +174,12 @@ class BatchLoopbackScript(scripts.Script):
             if not self.output_images: return
 
             self.init_latent = p.init_latent
-            self.init_images = list(p.init_images)
 
         last_latent = self.__to_latent(p, self.output_images.get_current())
-        p.init_latent = p.init_latent * (1.0 - loopback_mix) + last_latent * loopback_mix
+        feedback_latent = self.init_latent * (1. - wet_mix) + last_latent * wet_mix
+        p.init_latent = p.init_latent * (1. - loopback_mix) + feedback_latent * loopback_mix
 
-    def postprocess_batch(self, p, loopback_mix, **kwargs):
+    def postprocess_batch(self, p, loopback_mix, wet_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
 
@@ -172,8 +187,9 @@ class BatchLoopbackScript(scripts.Script):
         self.output_images.append(images)
         if not self.is_img2img_batch:
             self.output_images.lock_size()
+            p.init_latent = self.init_latent
 
-    def postprocess(self, p, processed, loopback_mix):
+    def postprocess(self, p, processed, loopback_mix, wet_mix):
         if not self.is_img2img_batch:
             self.output_images.clear()
 
@@ -192,14 +208,13 @@ class BatchLoopbackScript(scripts.Script):
         self.is_img2img_batch = True
         self.output_images.clear()
         self.init_latent = None
-        self.init_images = None
+        self.increment_img2img_batch_seed = (self.increment_img2img_batch_seed[0], self.increment_img2img_batch_seed[0])
         self.seed = p.seed
         self.subseed = p.subseed
 
     def img2img_process_batch_tab_each(self, p):
         self.init_latent = p.init_latent
-        self.init_images = p.init_images
-        if self.increment_img2img_batch_seed:
+        if self.increment_img2img_batch_seed[1]:
             if self.seed != -1:
                 self.seed += p.n_iter
             p.seed = self.seed
@@ -210,10 +225,8 @@ class BatchLoopbackScript(scripts.Script):
     def img2img_postprocess_batch_tab_each(self, p):
         self.output_images.lock_size()
         self.init_latent = None
-        self.init_images = None
 
     def img2img_postprocess_batch_tab(self, p):
         self.is_img2img_batch = False
         self.output_images.clear()
         self.init_latent = None
-        self.init_images = None
