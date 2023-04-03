@@ -1,3 +1,6 @@
+import numpy
+import torch
+
 from modules import scripts, processing, shared, devices
 import gradio as gr
 import torchvision
@@ -16,19 +19,21 @@ def img2img_process_batch_hijack(*args, **kwargs):
         callback()
 
     res_was_none = False
-    def img2img_scripts_run_hijack(*args, **kwargs):
-        nonlocal res_was_none
+    p = None
+    def img2img_scripts_run_hijack(pp, *args):
+        nonlocal res_was_none, p
+        p = pp
         if res_was_none:
             for callback in img2img_postprocess_batch_tab_each_callbacks:
-                callback()
+                callback(p)
 
         for callback in img2img_process_batch_tab_each_callbacks:
-            callback()
+            callback(p)
 
-        res = original_img2img_scripts_run(*args, **kwargs)
+        res = original_img2img_scripts_run(p, *args)
         if res is not None:
             for callback in img2img_postprocess_batch_tab_each_callbacks:
-                callback()
+                callback(p)
         else:
             res_was_none = True
 
@@ -42,7 +47,7 @@ def img2img_process_batch_hijack(*args, **kwargs):
     finally:
         if res_was_none:
             for callback in img2img_postprocess_batch_tab_each_callbacks:
-                callback()
+                callback(p)
 
         scripts.scripts_img2img.run = original_img2img_scripts_run
         for callback in img2img_postprocess_batch_tab_callbacks:
@@ -61,9 +66,11 @@ class BatchLoopbackScript(scripts.Script):
     def __init__(self):
         self.img2img_batch_index = 0
         self.is_img2img_batch = False
-        self.last_images = []
+        self.output_images = []
+        self.init_latent = None
+        self.init_images = None
         self.grow_last_images = True
-        self.current_image_index = 0
+        self.last_output_index = 0
 
         global img2img_process_batch_tab_callbacks, img2img_process_batch_tab_each_callbacks, img2img_postprocess_batch_tab_each_callbacks, img2img_postprocess_batch_tab_callbacks
         img2img_process_batch_tab_callbacks.append(self.img2img_process_batch_tab)
@@ -95,66 +102,83 @@ class BatchLoopbackScript(scripts.Script):
     def process(self, p, loopback_mix):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
+
         if not self.is_img2img_batch:
-            self.last_images.clear()
-            self.current_image_index = 0
+            self.output_images.clear()
+            self.last_output_index = 0
 
     def process_batch(self, p, loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
         if self.is_img2img_batch:
-            if self.img2img_batch_index == 0: return
+            if self.img2img_batch_index <= 0: return
+
+            last_output = self.output_images[self.last_output_index]
+
         else:
-            if not self.last_images: return
+            if not self.output_images: return
 
-        last_batch = self.last_images[self.current_image_index if self.is_img2img_batch else self.current_image_index - 1]
-        current_latent = p.init_latent
-        current_images = list(p.init_images)
+            last_output = self.output_images[-1]
+            self.init_latent = p.init_latent
+            self.init_images = list(p.init_images)
 
-        p.init_images.clear()
-        p.init_images.extend(last_batch)
         with devices.autocast():
-            p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
+            to_stack = []
+            for image in last_output:
+                image = numpy.array(image).astype(numpy.float32) / 255.0
+                image = numpy.moveaxis(image, 2, 0)
+                to_stack.append(image)
 
-        p.init_images.clear()
-        p.init_images.extend(current_images)
-
-        p.init_latent = p.init_latent * loopback_mix + current_latent * (1.0 - loopback_mix)
+            last_latent = 2. * torch.stack(to_stack).to(shared.device) - 1.
+            last_latent = shared.sd_model.get_first_stage_encoding(shared.sd_model.encode_first_stage(last_latent))
+            p.init_latent = p.init_latent * (1.0 - loopback_mix) + last_latent * loopback_mix
         pass
 
     def postprocess_batch(self, p, loopback_mix, **kwargs):
         if not isinstance(p, processing.StableDiffusionProcessingImg2Img): return
         if not loopback_mix: return
 
-        if not self.is_img2img_batch:
-            if shared.state.job_no == shared.state.job_count - 1:
-                self.last_images.clear()
-                self.current_image_index = 0
-                return
-
         images = [torchvision.transforms.ToPILImage()(image) for image in kwargs['images']]
         if self.grow_last_images:
-            self.last_images.append(images)
+            self.output_images.append(images)
         else:
-            self.last_images[self.current_image_index] = images
+            self.output_images[self.last_output_index] = images
 
-        self.current_image_index += 1
+        self.last_output_index += 1
+
+    def postprocess(self, p, processed, loopback_mix):
+        if not self.is_img2img_batch:
+            self.output_images.clear()
+            self.last_output_index = 0
+
+        self.seed = p.seed
+        self.subseed = p.subseed
 
     def img2img_process_batch_tab(self):
         self.img2img_batch_index = 0
         self.is_img2img_batch = True
-        self.last_images.clear()
+        self.output_images.clear()
+        self.init_latent = None
+        self.init_images = None
         self.grow_last_images = True
 
-    def img2img_process_batch_tab_each(self):
-        self.current_image_index = 0
+    def img2img_process_batch_tab_each(self, p):
+        self.last_output_index = 0
+        self.init_latent = p.init_latent
+        self.init_images = p.init_images
+        p.seed = self.seed
+        p.subseed = self.subseed
 
-    def img2img_postprocess_batch_tab_each(self):
+    def img2img_postprocess_batch_tab_each(self, p):
         self.img2img_batch_index += 1
         self.grow_last_images = False
+        self.init_latent = None
+        self.init_images = None
 
     def img2img_postprocess_batch_tab(self):
         self.img2img_batch_index = 0
         self.is_img2img_batch = False
-        self.last_images.clear()
+        self.output_images.clear()
+        self.init_latent = None
+        self.init_images = None
         self.grow_last_images = True
