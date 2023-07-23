@@ -907,7 +907,7 @@ class Script(scripts.Script):
     def postprocess_batch(self, p, *args, **kwargs):
         images = kwargs.get('images', [])
         for post_processor in self.post_processors:
-            for i in range(images.shape[0]):
+            for i in range(len(images)):
                 images[i] = post_processor(images[i])
         return
 
